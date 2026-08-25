@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-
-"""Summarize A5 multiprocess Scatter Copy timing results."""
+"""Summarize this repository's multi-card scatter-copy timing results."""
 
 from __future__ import annotations
 
@@ -19,25 +18,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--results-dir",
         type=Path,
-        default=repo_root / "results" / "a5_multiprocess",
-        help="Directory produced by run_scatter_copy_multiprocess.sh.",
+        default=repo_root / "results" / "kvcache_scatter_copy_multiprocess",
+        help="Directory produced by run_kvcache_scatter_copy_multiprocess.sh.",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        help="Output CSV path (default: RESULTS_DIR/scatter_copy_timing_summary.csv).",
+        help=(
+            "Output CSV path (default: RESULTS_DIR/"
+            "kvcache_scatter_copy_timing_summary.csv)."
+        ),
     )
     return parser.parse_args()
 
 
 def normalize_case(case: dict[str, object]) -> dict[str, object]:
+    if case.get("status") != "passed":
+        raise ValueError("Cannot analyze a failed multiprocess case")
     config = case["config"]
     summary = case["summary"]
+    if not isinstance(config, dict) or not isinstance(summary, dict):
+        raise ValueError("Invalid multiprocess result schema")
     return {
-        "cards": case["device_count"],
+        "cards": int(case["device_count"]),
         "dtype": config["dtype"],
-        "batch_size": config["batch_size"],
-        "copy_count": config["copy_max"],
+        "batch_size": int(config["batch_size"]),
+        "copy_count": int(config["copy_max"]),
         "avg_us_min": summary["avg_us_min"],
         "avg_us_mean": summary["avg_us_mean"],
         "avg_us_max": summary["avg_us_max"],
@@ -52,15 +58,22 @@ def load_cases(results_dir: Path) -> list[dict[str, object]]:
     case_paths = sorted(results_dir.glob("cards*_*.json"))
     if not case_paths:
         raise FileNotFoundError(f"No case JSON files found in {results_dir}")
-    return [
+    cases = [
         json.loads(path.read_text(encoding="utf-8")) for path in case_paths
     ]
+    failed = [path for path, case in zip(case_paths, cases) if case.get("status") != "passed"]
+    if failed:
+        names = ", ".join(path.name for path in failed)
+        raise RuntimeError(f"Failed case JSON files found: {names}")
+    return cases
 
 
 def write_summary(
     results_dir: Path, cases: list[dict[str, object]]
 ) -> Path:
-    summary_path = results_dir / "scatter_copy_multiprocess_summary.json"
+    summary_path = (
+        results_dir / "kvcache_scatter_copy_multiprocess_summary.json"
+    )
     summary = {
         "schema_version": 1,
         "test": "a5_kvcache_scatter_copy_multiprocess_sweep",
@@ -80,13 +93,12 @@ def write_summary(
 
 
 def build_timing(cases: list[dict[str, object]]) -> pd.DataFrame:
-    rows = [normalize_case(case) for case in cases]
-    if not rows:
-        raise ValueError("No cases available for analysis.")
-    timing = pd.DataFrame(rows).sort_values(
+    timing = pd.DataFrame(normalize_case(case) for case in cases)
+    if timing.empty:
+        raise ValueError("No cases available for analysis")
+    timing = timing.sort_values(
         ["cards", "dtype", "batch_size", "copy_count"]
-    )
-    timing = timing.reset_index(drop=True)
+    ).reset_index(drop=True)
     for column in timing.select_dtypes(include="number").columns:
         if column not in {"cards", "batch_size", "copy_count"}:
             timing[column] = timing[column].round(3)
@@ -99,7 +111,11 @@ def print_tables(timing: pd.DataFrame) -> None:
     table = timing.pivot_table(
         index=["cards", "dtype", "batch_size"],
         columns="copy_count",
-        values=["avg_us_mean", "avg_us_max", "payload_gbps_sum_by_avg_us_max"],
+        values=[
+            "avg_us_mean",
+            "avg_us_max",
+            "payload_gbps_sum_by_avg_us_max",
+        ],
         aggfunc="first",
     ).sort_index(axis=1, level=[0, 1])
     print("\n===== A5 MULTIPROCESS PIVOT =====")
@@ -112,7 +128,7 @@ def main() -> None:
     output = (
         args.output.resolve()
         if args.output is not None
-        else results_dir / "scatter_copy_timing_summary.csv"
+        else results_dir / "kvcache_scatter_copy_timing_summary.csv"
     )
     cases = load_cases(results_dir)
     summary_path = write_summary(results_dir, cases)

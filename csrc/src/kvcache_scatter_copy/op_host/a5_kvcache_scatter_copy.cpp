@@ -51,8 +51,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     const ge::DataType cacheDataType =
         context->GetInputDesc(HBM_K_ROPE)->GetDataType();
     if (cacheDataType != ge::DT_BF16 &&
-        cacheDataType != ge::DT_FLOAT16 &&
-        cacheDataType != ge::DT_INT8) {
+        cacheDataType != ge::DT_FLOAT16) {
         return ge::GRAPH_FAILED;
     }
     for (size_t i = HBM_K_ROPE; i <= DRAM_KV_CACHE; ++i) {
@@ -60,8 +59,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
             return ge::GRAPH_FAILED;
         }
     }
-    const uint32_t elementBytes =
-        cacheDataType == ge::DT_INT8 ? 1U : 2U;
+    for (size_t i = HBM_BLOCK_TABLE; i <= COPY_COUNTS; ++i) {
+        if (context->GetInputDesc(i)->GetDataType() != ge::DT_INT32) {
+            return ge::GRAPH_FAILED;
+        }
+    }
+    constexpr uint32_t elementBytes = 2U;
 
     const gert::Shape hbmRope = context->GetInputShape(HBM_K_ROPE)->GetStorageShape();
     const gert::Shape hbmKv = context->GetInputShape(HBM_KV_CACHE)->GetStorageShape();
@@ -93,7 +96,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         srcIds.GetDim(0) != batchSize ||
         dstSlots.GetDim(0) != batchSize || dstSlots.GetDim(1) != copyCap ||
         hbmTable.GetDim(0) != batchSize || dramTable.GetDim(0) != batchSize ||
-        hbmTable.GetDim(1) <= 0 || dramTable.GetDim(1) <= 0) {
+        hbmTable.GetDim(1) <= 0 || dramTable.GetDim(1) <= 0 ||
+        dramTable.GetDim(1) * BLOCK_SIZE > (1 << 18)) {
         return ge::GRAPH_FAILED;
     }
 
@@ -159,13 +163,13 @@ public:
     explicit A5KvcacheScatterCopy(const char* name) : OpDef(name)
     {
         const std::vector<ge::DataType> dataTypes = {
-            ge::DT_BF16, ge::DT_FLOAT16, ge::DT_INT8};
+            ge::DT_BF16, ge::DT_FLOAT16};
         const std::vector<ge::DataType> intTypes = {
-            ge::DT_INT32, ge::DT_INT32, ge::DT_INT32};
+            ge::DT_INT32, ge::DT_INT32};
         const std::vector<ge::Format> dataFormats = {
-            ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND};
+            ge::FORMAT_ND, ge::FORMAT_ND};
         const std::vector<ge::Format> intFormats = {
-            ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND};
+            ge::FORMAT_ND, ge::FORMAT_ND};
 
         this->Input("hbm_k_rope").ParamType(REQUIRED).DataType(dataTypes).Format(dataFormats);
         this->Input("hbm_kv_cache").ParamType(REQUIRED).DataType(dataTypes).Format(dataFormats);
@@ -179,9 +183,17 @@ public:
         this->Output("hbm_k_rope_out").ParamType(REQUIRED).DataType(dataTypes).Format(dataFormats);
         this->Output("hbm_kv_cache_out").ParamType(REQUIRED).DataType(dataTypes).Format(dataFormats);
 
+        OpAICoreConfig config;
+        config.DynamicCompileStaticFlag(true)
+            .DynamicFormatFlag(true)
+            .DynamicRankSupportFlag(true)
+            .DynamicShapeSupportFlag(true)
+            .NeedCheckSupportFlag(false)
+            .PrecisionReduceFlag(true)
+            .ExtendCfgInfo("aclnnSupport.value", "support_aclnn");
         this->AICore()
             .SetTiling(optiling::TilingFunc)
-            .AddConfig("ascend950");
+            .AddConfig("ascend950", config);
     }
 };
 OP_ADD(A5KvcacheScatterCopy);

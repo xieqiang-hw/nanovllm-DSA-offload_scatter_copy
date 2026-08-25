@@ -10,6 +10,7 @@ from torch.utils.cpp_extension import BuildExtension, verify_ninja_availability
 
 ROOT = Path(__file__).resolve().parent
 CSRC = ROOT / "csrc"
+TORCH_NPU_ROOT = Path(torch_npu.__file__).resolve().parent
 USE_NINJA = os.getenv("USE_NINJA") == "1"
 MAX_JOBS = int(os.getenv("MAX_JOBS", multiprocessing.cpu_count()))
 
@@ -17,14 +18,20 @@ if USE_NINJA:
     verify_ninja_availability()
 
 setup(
-    name="ops_dsa_offload_a5",
+    name="nanovllm_dsa_a5",
     version="0.1.0",
     packages=find_packages(),
     ext_modules=[
         NpuExtension(
-            name="ops_dsa_offload_a5._C",
-            sources=[str(CSRC / "ops.cpp")],
+            name="nanovllm_dsa_a5._C",
+            sources=[
+                str(CSRC / "ops_registration.cpp"),
+                str(CSRC / "npu_kvcache_scatter_copy.cpp"),
+                str(CSRC / "op_api_common.cpp"),
+            ],
+            include_dirs=[str(CSRC)],
             extra_compile_args=[
+                f"-I{TORCH_NPU_ROOT / 'include' / 'third_party' / 'acl' / 'inc'}",
                 "-O3",
                 "-std=c++17",
                 "-fvisibility=hidden",
@@ -38,4 +45,3 @@ setup(
         )
     },
 )
-

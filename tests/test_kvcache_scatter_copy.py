@@ -13,8 +13,10 @@ from pathlib import Path
 import torch
 
 # Select the repository-local custom OPP before torch_npu is initialized.
-import ops_dsa_offload_a5
+import nanovllm_dsa_a5
 import torch_npu  # type: ignore  # noqa: E402
+
+from _utils import require_a5, swapped_from_cpu
 
 
 BLOCK_SIZE = 128
@@ -62,17 +64,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--copy-cap", type=int, default=2048)
     parser.add_argument(
         "--dtype",
-        choices=("bf16", "int8"),
+        choices=("bf16", "fp16"),
         default="bf16",
     )
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument(
-        "--json-output",
-        type=Path,
-        help="Write the configuration, checks, and timing result to JSON.",
-    )
+    parser.add_argument("--json-output", type=Path)
     parser.add_argument(
         "--allow-non-a5",
         action="store_true",
@@ -125,27 +123,24 @@ def random_block_table(
     return table.to(torch.int32).contiguous(), total_blocks
 
 
-def swapped_from_cpu(
-    cpu: torch.Tensor,
-    device: torch.device,
-) -> torch.Tensor:
-    if not hasattr(torch_npu, "empty_with_swapped_memory"):
-        raise RuntimeError(
-            "torch_npu.empty_with_swapped_memory is unavailable. "
-            "This test refuses to replace DRAM with an HBM tensor."
-        )
-    tensor = torch_npu.empty_with_swapped_memory(
-        cpu.shape,
-        dtype=cpu.dtype,
-        device=device,
+def random_shared_source_table(
+    batch_size: int,
+    blocks_per_row: int,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, int]:
+    """Random per-request views over one read-only physical DRAM pool."""
+
+    table = torch.stack(
+        [
+            torch.randperm(
+                blocks_per_row,
+                generator=generator,
+                dtype=torch.int64,
+            ).to(torch.int32)
+            for _ in range(batch_size)
+        ]
     )
-    tensor.fill_(0)
-    staging = cpu.to(device)
-    tensor.add_(staging)
-    torch.npu.synchronize()
-    del staging
-    torch.npu.empty_cache()
-    return tensor
+    return table.contiguous(), blocks_per_row
 
 
 def make_cache_tensor(
@@ -153,14 +148,6 @@ def make_cache_tensor(
     dtype: torch.dtype,
     generator: torch.Generator,
 ) -> torch.Tensor:
-    if dtype == torch.int8:
-        return torch.randint(
-            -120,
-            121,
-            shape,
-            generator=generator,
-            dtype=torch.int16,
-        ).to(torch.int8)
     return torch.randn(
         shape,
         generator=generator,
@@ -170,20 +157,7 @@ def make_cache_tensor(
 
 def make_case(args: argparse.Namespace) -> Case:
     device = torch.device(args.device)
-    device_index = (
-        device.index
-        if device.index is not None
-        else torch.npu.current_device()
-    )
-    get_device_name = getattr(torch.npu, "get_device_name", None)
-    if get_device_name is None:
-        get_device_name = torch_npu.npu.get_device_name
-    device_name = get_device_name(device_index)
-    if "950" not in device_name.lower() and not args.allow_non_a5:
-        raise RuntimeError(
-            f"Expected an Ascend 950 device, got {device_name!r}. "
-            "Use --allow-non-a5 only for portability debugging."
-        )
+    device_name = require_a5(device, args.allow_non_a5)
 
     generator = torch.Generator().manual_seed(args.seed)
     source_blocks_per_row = (
@@ -192,7 +166,9 @@ def make_case(args: argparse.Namespace) -> Case:
     hbm_blocks_per_row = (
         args.hbm_slots + BLOCK_SIZE - 1
     ) // BLOCK_SIZE
-    dram_table_cpu, dram_blocks = random_block_table(
+    # DRAM is read-only, so requests can use independent permutations of one
+    # source pool. HBM destinations remain private to each request.
+    dram_table_cpu, dram_blocks = random_shared_source_table(
         args.batch_size,
         source_blocks_per_row,
         generator,
@@ -203,7 +179,7 @@ def make_case(args: argparse.Namespace) -> Case:
         generator,
     )
     cache_dtype = (
-        torch.bfloat16 if args.dtype == "bf16" else torch.int8
+        torch.bfloat16 if args.dtype == "bf16" else torch.float16
     )
 
     dram_kpe_cpu = make_cache_tensor(
@@ -231,8 +207,11 @@ def make_case(args: argparse.Namespace) -> Case:
         generator=generator,
         dtype=torch.int64,
     )
-    if int(sampled_counts.sum()) == 0:
-        sampled_counts[0] = args.copy_max
+    # Multi-row cases pin both endpoints.  Keep the seeded random sample for
+    # batch=1 so a 0..300 benchmark does not become a zero-copy benchmark.
+    if args.batch_size > 1:
+        sampled_counts[0] = args.copy_min
+        sampled_counts[1] = args.copy_max
     counts = sampled_counts.tolist()
     for row in range(args.batch_size):
         count = counts[row]
@@ -314,7 +293,7 @@ def call_scatter(
     case: Case,
     copy_counts: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return ops_dsa_offload_a5.kvcache_scatter_copy(
+    return nanovllm_dsa_a5.kvcache_scatter_copy(
         case.hbm_kpe,
         case.hbm_ckv,
         case.dram_kpe,
@@ -399,7 +378,21 @@ def assert_copied(
         raise AssertionError("An inactive HBM guard row was modified.")
 
 
-def write_json_result(path: Path, result: dict[str, object]) -> None:
+def wait_for_start(ready_file: Path | None, start_file: Path | None) -> None:
+    if ready_file is None and start_file is None:
+        return
+    if ready_file is None or start_file is None:
+        raise ValueError("ready and start files must be specified together")
+    ready_file.parent.mkdir(parents=True, exist_ok=True)
+    ready_file.write_text("ready\n", encoding="utf-8")
+    deadline = time.monotonic() + 600
+    while not start_file.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Timed out waiting for multiprocess start")
+        time.sleep(0.01)
+
+
+def write_json(path: Path, result: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(
@@ -407,36 +400,6 @@ def write_json_result(path: Path, result: dict[str, object]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
-
-
-def wait_for_multiprocess_start(args: argparse.Namespace) -> None:
-    if args.ready_file is None and args.start_file is None:
-        return
-    if args.ready_file is None or args.start_file is None:
-        raise ValueError("--ready-file and --start-file must be used together.")
-    args.ready_file.parent.mkdir(parents=True, exist_ok=True)
-    args.ready_file.write_text("ready\n", encoding="utf-8")
-    deadline = time.monotonic() + 600
-    while not args.start_file.exists():
-        if time.monotonic() >= deadline:
-            raise TimeoutError("Timed out waiting for the multi-card start signal.")
-        time.sleep(0.01)
-
-
-def wait_for_multiprocess_timing_start(args: argparse.Namespace) -> None:
-    if args.timing_ready_file is None and args.timing_start_file is None:
-        return
-    if args.timing_ready_file is None or args.timing_start_file is None:
-        raise ValueError(
-            "--timing-ready-file and --timing-start-file must be used together."
-        )
-    args.timing_ready_file.parent.mkdir(parents=True, exist_ok=True)
-    args.timing_ready_file.write_text("ready\n", encoding="utf-8")
-    deadline = time.monotonic() + 600
-    while not args.timing_start_file.exists():
-        if time.monotonic() >= deadline:
-            raise TimeoutError("Timed out waiting for the multi-card timing signal.")
-        time.sleep(0.01)
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
@@ -457,7 +420,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         f"copy_cap={args.copy_cap} "
         f"copy_range=[{args.copy_min},{args.copy_max}] "
         f"copy_counts={case.copy_counts_cpu.tolist()} "
-        f"opapi={ops_dsa_offload_a5.local_opapi_path()}"
+        f"opapi={nanovllm_dsa_a5.local_opapi_path()}"
     )
 
     poison_hbm(case)
@@ -488,12 +451,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     assert_all_hbm_poisoned(case)
     print("A5_SCATTER_ZERO_COUNT_CHECK all_hbm_unchanged=1 ok=1")
 
-    wait_for_multiprocess_start(args)
-
+    wait_for_start(args.ready_file, args.start_file)
     for _ in range(args.warmup):
         call_scatter(case)
     torch.npu.synchronize()
-    wait_for_multiprocess_timing_start(args)
+    wait_for_start(args.timing_ready_file, args.timing_start_file)
 
     start = torch.npu.Event(enable_timing=True)
     end = torch.npu.Event(enable_timing=True)
@@ -513,7 +475,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         else 0.0
     )
     print(
-        "A5_SCATTER_RESULT "
+        "A5_KVCACHE_SCATTER_COPY_RESULT "
         f"copy_min={args.copy_min} copy_max={args.copy_max} "
         f"copied_tokens={copied_tokens} avg_us={avg_us:.3f} "
         f"payload_gbps={payload_gbps:.3f} timer=npu_event "
@@ -538,18 +500,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "warmup": args.warmup,
             "iters": args.iters,
             "seed": args.seed,
-            "opapi": ops_dsa_offload_a5.local_opapi_path(),
+            "opapi": nanovllm_dsa_a5.local_opapi_path(),
         },
         "workload": {
             "copy_counts": case.copy_counts_cpu.tolist(),
             "copied_tokens": copied_tokens,
-            "bytes_per_token": (
-                (CKV_DIM + KPE_DIM) * case.dram_ckv_cpu.element_size()
-            ),
             "payload_bytes_per_iteration": payload_bytes,
         },
         "correctness": {
-            "allocator": "empty_with_swapped_memory",
             "data_exact": True,
             "output_alias": True,
             "guard_unchanged": True,
@@ -558,14 +516,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "performance": {
             "timer": "npu_event",
             "avg_us": avg_us,
-            "min_us": avg_us,
-            "max_us": avg_us,
             "payload_gbps": payload_gbps,
-            "total_payload_gbps": payload_gbps,
         },
     }
     if args.json_output is not None:
-        write_json_result(args.json_output, result)
+        write_json(args.json_output, result)
         print(f"A5_SCATTER_JSON path={args.json_output}")
     print("A5_KVCACHE_SCATTER_COPY_UT_OK")
     return result
