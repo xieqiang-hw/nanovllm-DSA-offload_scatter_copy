@@ -16,7 +16,6 @@ if _EXPLICIT_OPAPI:
 else:
     _OPAPI_LIBS = tuple(
         path
-        path
         for path in (_LOCAL_OPP / "vendors").glob("*/op_api/lib/libcust_opapi.so")
     )
     if len(_OPAPI_LIBS) != 1:
