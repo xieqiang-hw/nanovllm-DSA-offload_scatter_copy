@@ -65,3 +65,6 @@ done
 
 python3 tests/analyze_kvcache_scatter_copy_results.py \
   --results-dir "${RESULTS_DIR}"
+
+python3 tests/format_kvcache_scatter_copy_csv.py \
+  --input "${RESULTS_DIR}/kvcache_scatter_copy_timing_summary.csv"
