@@ -3,6 +3,7 @@
 
 import ctypes
 import errno
+import os
 import sys
 import tempfile
 import unittest
@@ -21,6 +22,20 @@ import test_scatter_copy_multiprocess as multi
 
 def fake_topology():
     return {"nodes": {n: {"cpus": list(range(n * 80, (n + 1) * 80))} for n in range(8)}}
+
+
+def registration_line(svm=0xDFFF91C00000, host=0x12C180000000, pid=None):
+    pid = os.getpid() if pid is None else pid
+    return (f'[WARNING] APP({pid},python3):2026-09-05-23:04:51.750.583 '
+            '[log_inner.cpp:81]1841 build/CMakeFiles/torch_npu.dir/compiler_depend.ts:'
+            f'registerSvmMem:70: "[PTA]:"The svmPtr({hex(svm)}) is not equel to '
+            f'alignedPtr({hex(host)}), then the memory pointed by svmPtr can not be printed '
+            'directly on host ""\n')
+
+
+def fake_maps(start=4096, end=8192):
+    return {"overlapping_maps": [f"{start:x}-{end:x} rw-p 00000000 00:00 0"],
+            "overlapping_numa_maps": []}
 
 
 class PlanTests(unittest.TestCase):
@@ -133,11 +148,155 @@ class ResidencyTests(unittest.TestCase):
 
     def test_svm_query_failure_is_reported_without_cpu_read(self):
         tensor = SimpleNamespace(data_ptr=lambda: 4096, numel=lambda: 2048, element_size=lambda: 2)
-        with patch.object(numa, "mapping_lines", return_value={}), patch.object(numa, "NumaAPI") as api:
+        with patch.object(numa, "mapping_lines", return_value=fake_maps()), patch.object(numa, "NumaAPI") as api:
             api.return_value.query_pages.side_effect = OSError(errno.EPERM, "query blocked")
             result = numa.inspect_buffer(tensor, 16, [0], 1024)
         self.assertFalse(result["verified"])
         self.assertIn("query blocked", result["error"])
+
+
+class HostMappingTests(unittest.TestCase):
+    def mapping(self, svm=0xDFFF91C00000, host=0x12C180000000):
+        mappings = {}
+        numa.record_registration(mappings, registration_line(svm, host), os.getpid())
+        return mappings[svm]
+
+    def test_exact_warning_format_and_pid_filter(self):
+        mappings = {}
+        numa.record_registration(mappings, registration_line(pid=os.getpid() + 1), os.getpid())
+        numa.record_registration(mappings, registration_line().replace("registerSvmMem", "other"), os.getpid())
+        self.assertEqual(mappings, {})
+        line = registration_line()
+        numa.record_registration(mappings, line, os.getpid())
+        numa.record_registration(mappings, line, os.getpid())
+        self.assertEqual(len(mappings), 1)
+        self.assertEqual(mappings[0xDFFF91C00000]["host_ptr"], "0x12c180000000")
+        self.assertEqual(mappings[0xDFFF91C00000]["log_line"], line.rstrip())
+
+    def test_conflicting_mapping_never_becomes_valid_again(self):
+        mappings = {}
+        for host in (0x10000, 0x20000, 0x10000):
+            numa.record_registration(mappings, registration_line(host=host), os.getpid())
+            if host == 0x20000:
+                self.assertIsNone(mappings[0xDFFF91C00000]["host_ptr"])
+        self.assertIn("error", mappings[0xDFFF91C00000])
+        self.assertIsNone(mappings[0xDFFF91C00000]["host_ptr"])
+
+    def test_logging_configuration_before_torch_import(self):
+        with patch.dict(os.environ, {"ASCEND_GLOBAL_LOG_LEVEL": "4", "ASCEND_SLOG_PRINT_TO_STDOUT": "0"}):
+            report = numa.prepare_registration_logging()
+            self.assertEqual(report["previous"]["ASCEND_GLOBAL_LOG_LEVEL"], "4")
+            self.assertEqual(os.environ["ASCEND_GLOBAL_LOG_LEVEL"], "2")
+            self.assertEqual(os.environ["ASCEND_SLOG_PRINT_TO_STDOUT"], "1")
+        with patch.dict(sys.modules, {"torch_npu": Mock()}):
+            with self.assertRaisesRegex(RuntimeError, "before importing"):
+                numa.prepare_registration_logging()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "native fd capture requires Linux")
+    def test_native_stdout_and_stderr_are_captured_and_replayed(self):
+        output = io.StringIO()
+        before = [os.fstat(fd) for fd in (1, 2)]
+        with contextlib.redirect_stdout(output):
+            with numa.capture_registration_logs() as mappings:
+                os.write(1, registration_line().encode())
+                os.write(2, registration_line(svm=0xDFFFC1E00000, host=0x12C001600000).encode())
+                os.write(2, b"unrelated runtime warning is preserved\n")
+        self.assertEqual(len(mappings), 2)
+        self.assertIn("unrelated runtime warning", output.getvalue())
+        self.assertEqual(output.getvalue().count("[WARNING]"), 2)
+        self.assertEqual([(s.st_dev, s.st_ino) for s in before],
+                         [(os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in (1, 2)])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "native fd capture requires Linux")
+    def test_allocation_exception_restores_output_and_keeps_warning(self):
+        output = io.StringIO()
+        before = [(os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in (1, 2)]
+        with contextlib.redirect_stdout(output):
+            with self.assertRaisesRegex(RuntimeError, "allocation failed"):
+                with numa.capture_registration_logs() as mappings:
+                    os.write(2, registration_line().encode())
+                    raise RuntimeError("allocation failed")
+        self.assertEqual(len(mappings), 1)
+        self.assertIn("alignedPtr", output.getvalue())
+        self.assertEqual(before, [(os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in (1, 2)])
+
+    def test_queries_host_pages_and_active_token_offsets_not_svm(self):
+        svm, host = 0xDFFF91C00000, 0x12C180000000
+        tensor = SimpleNamespace(data_ptr=lambda: svm, numel=lambda: 4096, element_size=lambda: 2)
+        def maps(ptr, nbytes):
+            self.assertEqual(nbytes, 8192)
+            return fake_maps(host, host + 8192) if ptr == host else {
+                "overlapping_maps": [], "overlapping_numa_maps": []}
+        with patch.object(numa, "mapping_lines", side_effect=maps), patch.object(numa, "NumaAPI") as api:
+            api.return_value.query_pages.side_effect = lambda addresses: [4] * len(addresses)
+            result = numa.inspect_buffer(tensor, 1024, [1, 7], 1024, self.mapping())
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["tensor_ptr"], hex(svm))
+        self.assertEqual(result["host_ptr"], hex(host))
+        self.assertEqual(result["allocation"]["node_pages"], {"4": 2})
+        calls = api.return_value.query_pages.call_args_list
+        self.assertEqual(calls[0].args[0], [host, host + 4096])
+        self.assertEqual(set(calls[1].args[0]), {host, host + 4096})
+        self.assertEqual(numa.placement_result({"a": result}, "bind", [0]), "policy_mismatch")
+
+    def test_host_mapping_does_not_hide_driver_page_query_errors(self):
+        svm, host = 0xDFFF91C00000, 0x12C180000000
+        tensor = SimpleNamespace(data_ptr=lambda: svm, numel=lambda: 2048, element_size=lambda: 2)
+        with patch.object(numa, "mapping_lines", return_value=fake_maps(host, host + 4096)), \
+                patch.object(numa, "NumaAPI") as api:
+            api.return_value.query_pages.return_value = [-errno.EFAULT]
+            result = numa.inspect_buffer(tensor, 16, [0], 1024, self.mapping())
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["host_ptr"], hex(host))
+        self.assertEqual(result["allocation"]["page_errors"], {"EFAULT": 1})
+
+    def test_missing_mapping_and_unmapped_svm_is_not_queried(self):
+        tensor = SimpleNamespace(data_ptr=lambda: 0xDFFF91C00000, numel=lambda: 2048, element_size=lambda: 2)
+        with patch.object(numa, "mapping_lines", return_value={"overlapping_maps": [], "overlapping_numa_maps": []}), \
+                patch.object(numa, "NumaAPI") as api:
+            result = numa.inspect_buffer(tensor, 16, [0], 1024)
+            api.assert_not_called()
+        self.assertFalse(result["verified"])
+        self.assertIn("registration mapping", result["error"])
+
+    def test_stale_or_conflicting_mapping_is_rejected(self):
+        svm, host = 0xDFFF91C00000, 0x12C180000000
+        tensor = SimpleNamespace(data_ptr=lambda: svm, numel=lambda: 2048, element_size=lambda: 2)
+        changes = ({"pid": os.getpid() + 1}, {"tensor_ptr": hex(svm + 4096)},
+                   {"host_ptr": None, "error": "conflict"})
+        for change in changes:
+            with patch.object(numa, "mapping_lines", return_value=fake_maps(host, host + 4096)), \
+                    patch.object(numa, "NumaAPI") as api:
+                result = numa.inspect_buffer(tensor, 16, [0], 1024, self.mapping() | change)
+                api.assert_not_called()
+            self.assertFalse(result["verified"])
+            self.assertIn("stale", result["error"])
+
+    def test_same_va_runtime_remains_supported(self):
+        tensor = SimpleNamespace(data_ptr=lambda: 4096, numel=lambda: 2048, element_size=lambda: 2)
+        with patch.object(numa, "mapping_lines", return_value=fake_maps()), patch.object(numa, "NumaAPI") as api:
+            api.return_value.query_pages.return_value = [0]
+            result = numa.inspect_buffer(tensor, 16, [], 1024)
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["host_ptr"], "0x1000")
+        self.assertIsNone(result["active_tokens"])
+
+    def test_host_vma_coverage_requires_entire_allocation(self):
+        self.assertFalse(numa.maps_cover_buffer([], 4096, 4096))
+        self.assertFalse(numa.maps_cover_buffer(fake_maps()["overlapping_maps"], 4096, 8192))
+        maps = fake_maps(4096, 8192)["overlapping_maps"] + fake_maps(12288, 16384)["overlapping_maps"]
+        self.assertFalse(numa.maps_cover_buffer(maps, 4096, 12288))
+        maps += fake_maps(8192, 12288)["overlapping_maps"]
+        self.assertTrue(numa.maps_cover_buffer(maps, 4096, 12288))
+
+    def test_invalid_active_row_never_queries_an_unrelated_page(self):
+        tensor = SimpleNamespace(data_ptr=lambda: 4096, numel=lambda: 2048, element_size=lambda: 2)
+        for row in (-1, 4):
+            with patch.object(numa, "NumaAPI") as api:
+                result = numa.inspect_buffer(tensor, 16, [row], 1024)
+                api.assert_not_called()
+            self.assertFalse(result["verified"])
+            self.assertIn("outside", result["error"])
 
 
 class HarnessTests(unittest.TestCase):

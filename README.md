@@ -139,7 +139,9 @@ CPU 与内存策略分开控制：默认 `--cpu-bind spread --cpus-per-worker 4`
 
 - 分别查询真实 swapped CKV/KPE 的页位置，并另采样实际被 copy 的 token 所在页；不以普通 CPU golden tensor 或全进程 RSS 冒充 source 的位置。
 - `move_pages(..., nodes=NULL, flags=0)` **只查询，不迁移、不解引用 NPU 指针、不修改已注册 DMA 页**。
-- 如果 SVM 地址与 Host 地址不同、驱动映射无法查询、系统不允许 `move_pages`，结果明确标记 `unverified`，保存相关 `/proc/self/maps`、`numa_maps` 行和错误码。此时设置成功也不能证明实际 source 被集中或均衡分配。
+- NUMA probe 会在导入 Torch/CANN 前将该 worker 的日志级别设为 WARNING、启用日志打屏。在本次 source 分配期间临时捕获原生 stdout/stderr，从 `torch_npu::registerSvmMem` 的 warning 中读取 `svmPtr → alignedPtr` 映射，随后原样重放捕获的日志。只采信当前 PID、与活跃 tensor 地址完全一致且无冲突的记录；不会读取旧 PLOG、硬编码上次运行的地址、按 VMA 大小猜测地址，也不修改/替换分配器。采集在 warmup/计时之前完成，各策略使用相同日志配置；不启用 NUMA probe 的旧测试不改变日志配置。
+- `alignedPtr` 是注册区域的真实 Host 起点，页采样和实际 copy token 的偏移均基于此地址。查询前要求 `/proc/self/maps` 覆盖整个 Host buffer；如果驱动使用相同 Host/NPU VA，也支持在完整 Host VMA 上直接查询 tensor 地址。**有地址映射不等于页位置已经验证。**
+- 如果当前运行未捕获可用映射、驱动 Host 映射无法查询、系统不允许 `move_pages`，结果明确标记 `unverified`，保存相关 `/proc/self/maps`、`numa_maps` 行和错误码。此时设置成功也不能证明实际 source 被集中或均衡分配。采集依赖该版本 Torch 的 warning 格式，未来版本若改变格式或没有及时打屏，不会猜测后继续声称验证成功。
 - `sample_verified` 只表示抽样成功且符合指定节点，不是全量页扫描。`policy_mismatch` 表示已查到页却落在指定节点外；`interleave_not_observed` 表示样本未覆盖全部指定节点。可加 `--require-numa-placement`，要求验证通过后才能计时；默认保留诊断和时延，即使页位置未验证。
 - `SCATTER_NUMA_NODE_LOAD` 根据样本打印按字节加权的 source 容量、实际 copy 读负载分布估计值；未验证时为 `null`，不会编造节点负载。
 
@@ -188,3 +190,17 @@ CPU-only 检查（不需要 NPU/编译）：
 ```bash
 python3 tests/test_numa_support.py -v
 ```
+
+### Host/SVM 地址不同的快速复测
+
+`worker-53232` 已确认 `empty_with_swapped_memory` 返回的 SVM 地址与 Host 地址不同：旧探针对 tensor 地址直接查询时全部返回 `EFAULT`。这不是 SCATTER 拷贝错误，也不是 NUMA 绑定失败的证据。更新 Python 脚本后无需重新编译，先在空闲设备上运行短测：
+
+```bash
+python3 tests/benchmark_scatter_copy_numa.py \
+  --experiment affinity --devices 0 --nodes 0,4 \
+  --batch-size 12 --source-len 65536 --hbm-slots 8192 \
+  --copy-count 300 --warmup 1 --iters 10 --rounds 1 \
+  --require-numa-placement
+```
+
+worker 日志中的 `A3_SCATTER_NUMA_ADDRESS_CAPTURE` 显示采集的映射数；`A3_SCATTER_NUMA_BUFFER` 分别打印 CKV/KPE 的 `tensor_ptr`、`host_ptr`、`node_pages`、`page_errors` 和 `verified`。只有最终 `placement_status=sample_verified` 才进入正式对照；如果转换成功但 Host 页仍返回 `EFAULT`，保留严格校验，将完整 `A3_SCATTER_NUMA_PLACEMENT` 贴出，再调查驱动映射的可查询性。这里的 10 次迭代只用于诊断，不用于判断性能或 NUMA 收益。

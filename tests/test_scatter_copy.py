@@ -14,7 +14,8 @@ from pathlib import Path
 # Torch/CANN imports are deliberately deferred to main(): NUMA/CPU policies must
 # be applied before either library creates background threads or host buffers.
 from numa_support import (
-    NumaAPI, apply_worker_policy, inspect_buffer, parse_ids, placement_result, process_status,
+    NumaAPI, apply_worker_policy, capture_registration_logs, inspect_buffer, parse_ids,
+    placement_result, prepare_registration_logging, process_status,
 )
 
 
@@ -421,7 +422,15 @@ def keep_copy_load_until_all_timed(args, launch):
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
-    case = make_case(args)
+    host_mappings = {}
+    if args.numa_probe or args.require_numa_placement:
+        with capture_registration_logs() as host_mappings:
+            case = make_case(args)
+        print(f"A3_SCATTER_NUMA_ADDRESS_CAPTURE pid={os.getpid()} "
+              f"registration_mappings={len(host_mappings)} "
+              "source=current_allocation_logs allocator_unchanged=1", flush=True)
+    else:
+        case = make_case(args)
     numa = getattr(args, "numa_setup", None)
     if numa is not None:
         numa["policy_after_allocation"] = NumaAPI().get_policy()
@@ -471,12 +480,22 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if args.numa_probe or args.require_numa_placement:
         rows = source_rows.tolist()
         buffers = {
-            "dram_ckv": inspect_buffer(case.dram_ckv, args.numa_page_samples, rows, CKV_DIM * 2),
-            "dram_kpe": inspect_buffer(case.dram_kpe, args.numa_page_samples, rows, KPE_DIM * 2),
+            "dram_ckv": inspect_buffer(case.dram_ckv, args.numa_page_samples, rows, CKV_DIM * 2,
+                                       host_mappings.get(case.dram_ckv.data_ptr())),
+            "dram_kpe": inspect_buffer(case.dram_kpe, args.numa_page_samples, rows, KPE_DIM * 2,
+                                       host_mappings.get(case.dram_kpe.data_ptr())),
         }
         nodes = parse_ids(args.memory_nodes) if args.memory_nodes else []
         status = placement_result(buffers, args.memory_policy, nodes)
         numa = {**(numa or {}), "placement_status": status, "buffers": buffers}
+        for name, buffer in buffers.items():
+            print("A3_SCATTER_NUMA_BUFFER " + json.dumps({
+                "name": name, "tensor_ptr": buffer["tensor_ptr"], "host_ptr": buffer["host_ptr"],
+                "verified": buffer["verified"],
+                "node_pages": buffer.get("allocation", {}).get("node_pages", {}),
+                "page_errors": buffer.get("allocation", {}).get("page_errors", {}),
+                "error": buffer.get("error"),
+            }, sort_keys=True), flush=True)
         print("A3_SCATTER_NUMA_PLACEMENT " + json.dumps(numa, sort_keys=True), flush=True)
         if args.require_numa_placement and status != "sample_verified":
             raise RuntimeError(f"Swapped source placement is {status}; no verified NUMA comparison is possible.")
@@ -592,6 +611,8 @@ def main() -> None:
             parse_ids(args.cpu_list) if args.cpu_list else [],
         )
         print("A3_SCATTER_NUMA_SETUP " + json.dumps(args.numa_setup, sort_keys=True), flush=True)
+    if args.numa_probe or args.require_numa_placement:
+        args.numa_setup["registration_logging"] = prepare_registration_logging()
     global torch, ops_overlap, torch_npu
     import torch
     # Select the repository-local OPP before torch_npu is initialized.

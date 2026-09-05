@@ -11,8 +11,11 @@ import ctypes
 import errno
 import os
 import random
+import re
 import sys
+import tempfile
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -232,28 +235,151 @@ def mapping_lines(ptr: int, nbytes: int) -> dict:
     return {"overlapping_maps": maps, "overlapping_numa_maps": numa}
 
 
-def inspect_buffer(tensor, sample_count: int, active_rows: list[int], row_bytes: int) -> dict:
+def prepare_registration_logging() -> dict:
+    """Call before importing Torch: its log-level check is cached on first use.
+
+    This is diagnostic logging, not an allocator hook. Keep it identical across
+    NUMA trials. Legacy tests without a placement probe do not call this helper.
+    """
+    if "torch_npu" in sys.modules:
+        raise RuntimeError("Registration logging must be enabled before importing torch_npu.")
+    names = ("ASCEND_GLOBAL_LOG_LEVEL", "ASCEND_SLOG_PRINT_TO_STDOUT")
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ["ASCEND_GLOBAL_LOG_LEVEL"] = "2"
+    os.environ["ASCEND_SLOG_PRINT_TO_STDOUT"] = "1"
+    return {"previous": previous, "effective": {name: os.environ[name] for name in names},
+            "scope": "NUMA probe worker; registration capture before timing"}
+
+
+_REGISTRATION = re.compile(
+    r"\bAPP\((\d+),[^\n]*?\bregisterSvmMem:\d+:[^\n]*?"
+    r"\bsvmPtr\((0x[0-9a-fA-F]+)\)[^\n]*?\balignedPtr\((0x[0-9a-fA-F]+)\)"
+)
+
+
+def record_registration(mappings: dict, line: str, pid: int) -> None:
+    """Read the exact torch_npu registration warning, never infer an address.
+
+    Only logs captured during this worker's live allocations are supplied here;
+    no old PLOG files, user-supplied addresses, VMA-size matching, or pointer
+    offsets are accepted as evidence. Conflicting records fail closed.
+    """
+    match = _REGISTRATION.search(line)
+    if match is None or int(match[1]) != pid:
+        return
+    svm, host = int(match[2], 16), int(match[3], 16)
+    if not svm or not host:
+        return
+    record = {"pid": pid, "tensor_ptr": hex(svm), "host_ptr": hex(host),
+              "source": "torch_npu.registerSvmMem/current_allocation_log",
+              "log_line": line.rstrip()}
+    previous = mappings.get(svm)
+    if previous is not None and previous["host_ptr"] != record["host_ptr"]:
+        previous.update(host_ptr=None, error="Conflicting Host addresses for one SVM address.")
+    else:
+        mappings[svm] = record
+
+
+@contextmanager
+def capture_registration_logs():
+    """Capture native stdout/stderr only during allocation, then replay it.
+
+    CANN prints the warning through native code; redirect_stdout alone cannot
+    capture it. A private temporary file avoids pipe-capacity deadlocks and old
+    logs. No output is swallowed, including when allocation raises. This is used
+    before graph capture/warmup/timing, with no concurrent benchmark launches.
+    """
+    mappings = {}
+    libc = ctypes.CDLL(None)
+    libc.fflush.argtypes = [ctypes.c_void_p]
+    libc.fflush.restype = ctypes.c_int
+
+    def flush():
+        sys.stdout.flush()
+        sys.stderr.flush()
+        libc.fflush(None)
+
+    with tempfile.TemporaryFile(mode="w+b") as log:
+        saved = {}
+        flush()
+        try:
+            for fd in (1, 2):
+                saved[fd] = os.dup(fd)
+                os.dup2(log.fileno(), fd)
+            yield mappings
+        finally:
+            try:
+                flush()
+            finally:
+                for fd, original in saved.items():
+                    try:
+                        os.dup2(original, fd)
+                    finally:
+                        os.close(original)
+            log.seek(0)
+            for raw in log:
+                line = raw.decode("utf-8", errors="replace")
+                record_registration(mappings, line, os.getpid())
+                sys.stdout.write(line)
+            sys.stdout.flush()
+
+
+def maps_cover_buffer(maps: list[str], ptr: int, nbytes: int) -> bool:
+    end = ptr + nbytes
+    cursor = ptr
+    ranges = sorted(tuple(int(x, 16) for x in line.split()[0].split("-")) for line in maps)
+    for lo, hi in ranges:
+        if lo > cursor:
+            break
+        cursor = max(cursor, hi)
+        if cursor >= end:
+            return True
+    return False
+
+
+def inspect_buffer(tensor, sample_count: int, active_rows: list[int], row_bytes: int,
+                   host_mapping: dict | None = None) -> dict:
     ptr = tensor.data_ptr()
     nbytes = tensor.numel() * tensor.element_size()
     page_size = os.sysconf("SC_PAGE_SIZE")
-    report = {"tensor_ptr": hex(ptr), "nbytes": nbytes, "page_size": page_size,
-              "method": "move_pages(nodes=NULL); tensor/SVM VA; no CPU dereference"}
+    report = {"tensor_ptr": hex(ptr), "host_ptr": None, "nbytes": nbytes,
+              "page_size": page_size, "address_mapping": host_mapping,
+              "method": "move_pages(nodes=NULL); Host VA; no CPU dereference"}
     try:
-        report.update(mapping_lines(ptr, nbytes))
+        if row_bytes <= 0 or any(row < 0 or (row + 1) * row_bytes > nbytes for row in active_rows):
+            raise ValueError("Active token rows are outside the source allocation.")
+        tensor_maps = mapping_lines(ptr, nbytes)
+        report["tensor_va_maps"] = tensor_maps
+        if host_mapping is not None:
+            if (host_mapping.get("pid") != os.getpid() or host_mapping.get("tensor_ptr") != hex(ptr)
+                    or host_mapping.get("error") or not host_mapping.get("host_ptr")):
+                raise ValueError("Invalid, stale, or ambiguous Host/SVM address mapping.")
+            host_ptr = int(host_mapping["host_ptr"], 16)
+            report["address_source"] = host_mapping["source"]
+            report.update(mapping_lines(host_ptr, nbytes))
+        else:
+            # Some runtime/driver combinations use the same Host and NPU VA.
+            # Require full Host VMA coverage; never blindly query an unmapped SVM VA.
+            host_ptr = ptr
+            report["address_source"] = "tensor_va_with_host_vma"
+            report.update(tensor_maps)
+        if host_ptr <= 0 or not maps_cover_buffer(report["overlapping_maps"], host_ptr, nbytes):
+            raise ValueError("No complete Host VMA for the source. A live registration mapping is required.")
+        report["host_ptr"] = hex(host_ptr)
         api = NumaAPI()
         report["allocation"] = summarize_pages(api.query_pages(
-            sample_addresses(ptr, nbytes, sample_count, page_size)))
+            sample_addresses(host_ptr, nbytes, sample_count, page_size)))
         # Query the pages the copy workload actually reads, not just the full
         # allocation. Duplicate pages are retained: counts are token-weighted.
         rows = random.Random(11).sample(active_rows, min(len(active_rows), sample_count))
         report["active_tokens"] = summarize_pages(api.query_pages(
-            [(ptr + row * row_bytes) // page_size * page_size for row in rows])) if rows else None
+            [(host_ptr + row * row_bytes) // page_size * page_size for row in rows])) if rows else None
         report["verified"] = report["allocation"]["verified"] and (
             report["active_tokens"] is None or report["active_tokens"]["verified"])
     except (OSError, ValueError) as error:
         report.update(verified=False, error=str(error))
     if not report["verified"]:
-        report["note"] = ("Unverified: SVM VA may differ from Host VA, registered pages may not "
+        report["note"] = ("Unverified: no usable live Host mapping was captured, registered pages may not "
                           "support residency queries, or permissions may block move_pages. "
                           "Process totals/memory policy alone do NOT prove buffer placement.")
     return report
