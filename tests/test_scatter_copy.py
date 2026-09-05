@@ -11,11 +11,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-import torch
-
-# Select the repository-local custom OPP before torch_npu is initialized.
-import ops_overlap
-import torch_npu  # noqa: E402
+# Torch/CANN imports are deliberately deferred to main(): NUMA/CPU policies must
+# be applied before either library creates background threads or host buffers.
+from numa_support import (
+    NumaAPI, apply_worker_policy, inspect_buffer, parse_ids, placement_result, process_status,
+)
 
 
 BLOCK_SIZE = 128
@@ -60,6 +60,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--timing", choices=("eager", "graph"), default="eager")
+    parser.add_argument("--memory-policy", choices=("inherit", "default", "bind", "interleave"), default="inherit")
+    parser.add_argument("--memory-nodes", default="")
+    parser.add_argument("--cpu-list", default="")
+    parser.add_argument("--numa-probe", action="store_true")
+    parser.add_argument("--numa-page-samples", type=int, default=1024)
+    parser.add_argument("--require-numa-placement", action="store_true")
     parser.add_argument(
         "--json-output",
         type=Path,
@@ -69,6 +76,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--timing-ready-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--timing-start-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--timing-done-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--timing-stop-file", type=Path, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -96,6 +105,10 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.warmup < 0 or args.iters <= 0:
         raise ValueError("--warmup must be non-negative and --iters positive.")
+    if args.numa_page_samples < 1:
+        raise ValueError("--numa-page-samples must be positive.")
+    if (args.memory_policy in ("bind", "interleave")) != bool(args.memory_nodes):
+        raise ValueError("bind/interleave require --memory-nodes; inherit/default require no nodes.")
 
 
 def random_block_table(
@@ -137,6 +150,7 @@ def swapped_from_cpu(
 
 def make_case(args: argparse.Namespace) -> Case:
     device = torch.device(args.device)
+    torch.npu.set_device(device)
     device_index = (
         device.index
         if device.index is not None
@@ -365,6 +379,17 @@ def wait_for_multiprocess_timing_start(args: argparse.Namespace) -> None:
         if time.monotonic() >= deadline:
             raise TimeoutError("Timed out waiting for the multi-card timing signal.")
         time.sleep(0.01)
+    signal = args.timing_start_file.read_text(encoding="utf-8").strip()
+    if signal != "start":
+        # A common future CLOCK_MONOTONIC deadline removes the 10 ms polling
+        # skew. Every worker has already synchronized its NPU before this gate.
+        target = float(signal)
+        while True:
+            remaining = target - time.monotonic()
+            if remaining <= 0:
+                break
+            if remaining > 0.002:
+                time.sleep(remaining - 0.001)
 
 
 def write_json_result(path: Path, result: dict[str, object]) -> None:
@@ -377,8 +402,34 @@ def write_json_result(path: Path, result: dict[str, object]) -> None:
     temporary.replace(path)
 
 
+def keep_copy_load_until_all_timed(args, launch):
+    if args.timing_done_file is None and args.timing_stop_file is None:
+        return
+    if args.timing_done_file is None or args.timing_stop_file is None:
+        raise ValueError("--timing-done-file and --timing-stop-file must be used together.")
+    args.timing_done_file.write_text("done\n", encoding="utf-8")
+    deadline = time.monotonic() + 600
+    # Fast workers must not go idle while a slower worker is still measuring:
+    # otherwise its last iterations see artificially reduced link contention.
+    # These idempotent copies are OUTSIDE this worker's recorded event interval.
+    while not args.timing_stop_file.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Timed out waiting for peers to finish measuring.")
+        for _ in range(32):
+            launch()
+        torch.npu.synchronize()
+
+
 def run(args: argparse.Namespace) -> dict[str, object]:
     case = make_case(args)
+    numa = getattr(args, "numa_setup", None)
+    if numa is not None:
+        numa["policy_after_allocation"] = NumaAPI().get_policy()
+        numa["allowed_after_allocation"] = process_status()
+        if numa["policy_after_allocation"] != numa["policy_after"]:
+            raise RuntimeError("Runtime changed the allocation thread's NUMA policy.")
+        if args.cpu_list and set(os.sched_getaffinity(0)) != set(parse_ids(args.cpu_list)):
+            raise RuntimeError("Runtime changed CPU affinity during NPU initialization/allocation.")
     source_rows, destination_rows = active_physical_rows(case)
     copied_tokens = int(case.copy_counts_cpu.sum())
     payload_bytes = copied_tokens * (CKV_DIM + KPE_DIM) * 2
@@ -417,21 +468,49 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         flush=True,
     )
 
+    if args.numa_probe or args.require_numa_placement:
+        rows = source_rows.tolist()
+        buffers = {
+            "dram_ckv": inspect_buffer(case.dram_ckv, args.numa_page_samples, rows, CKV_DIM * 2),
+            "dram_kpe": inspect_buffer(case.dram_kpe, args.numa_page_samples, rows, KPE_DIM * 2),
+        }
+        nodes = parse_ids(args.memory_nodes) if args.memory_nodes else []
+        status = placement_result(buffers, args.memory_policy, nodes)
+        numa = {**(numa or {}), "placement_status": status, "buffers": buffers}
+        print("A3_SCATTER_NUMA_PLACEMENT " + json.dumps(numa, sort_keys=True), flush=True)
+        if args.require_numa_placement and status != "sample_verified":
+            raise RuntimeError(f"Swapped source placement is {status}; no verified NUMA comparison is possible.")
+
+    launch = lambda: call_scatter(case)
+    graph = None
+    if args.timing == "graph":
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            call_scatter(case)
+        launch = graph.replay
+
     wait_for_multiprocess_start(args)
 
     for _ in range(args.warmup):
-        call_scatter(case)
+        launch()
     torch.npu.synchronize()
-    wait_for_multiprocess_timing_start(args)
-
     start = torch.npu.Event(enable_timing=True)
     end = torch.npu.Event(enable_timing=True)
+    # Initialize the underlying device events before the common start barrier.
     start.record()
-    for _ in range(args.iters):
-        call_scatter(case)
     end.record()
     end.synchronize()
+    wait_for_multiprocess_timing_start(args)
+    host_start_ns = time.monotonic_ns()
+    start.record()
+    for _ in range(args.iters):
+        launch()
+    end.record()
+    end.synchronize()
+    host_end_ns = time.monotonic_ns()
     avg_us = start.elapsed_time(end) * 1000 / args.iters
+    keep_copy_load_until_all_timed(args, launch)
 
     if copied_tokens:
         assert_copied(case, source_rows, destination_rows)
@@ -447,7 +526,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         f"copy_min={args.copy_min} copy_max={args.copy_max} "
         f"copy_cap={args.copy_cap} copied_tokens={copied_tokens} "
         f"avg_us={avg_us:.3f} payload_gbps={payload_gbps:.3f} "
-        f"timer=npu_event warmup={args.warmup} iters={args.iters}",
+        f"timer=npu_event timing={args.timing} warmup={args.warmup} iters={args.iters}",
         flush=True,
     )
     result: dict[str, object] = {
@@ -468,7 +547,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "warmup": args.warmup,
             "iters": args.iters,
             "seed": args.seed,
+            "timing": args.timing,
+            "hold_load_until_all_timed": args.timing_stop_file is not None,
             "opapi": ops_overlap.local_opapi_path(),
+            "torch_version": str(torch.__version__),
+            "torch_npu_version": str(torch_npu.__version__),
+            "torch_npu_git": getattr(getattr(torch_npu, "version", None), "git_version", "unknown"),
         },
         "workload": {
             "copy_counts": case.copy_counts_cpu.tolist(),
@@ -486,7 +570,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "timer": "npu_event",
             "avg_us": avg_us,
             "payload_gbps": payload_gbps,
+            "host_start_ns": host_start_ns,
+            "host_end_ns": host_end_ns,
         },
+        "numa": numa,
     }
     if args.json_output is not None:
         write_json_result(args.json_output, result)
@@ -498,6 +585,24 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    if args.memory_policy != "inherit" or args.cpu_list or args.numa_probe or args.require_numa_placement:
+        args.numa_setup = apply_worker_policy(
+            args.memory_policy,
+            parse_ids(args.memory_nodes) if args.memory_nodes else [],
+            parse_ids(args.cpu_list) if args.cpu_list else [],
+        )
+        print("A3_SCATTER_NUMA_SETUP " + json.dumps(args.numa_setup, sort_keys=True), flush=True)
+    global torch, ops_overlap, torch_npu
+    import torch
+    # Select the repository-local OPP before torch_npu is initialized.
+    import ops_overlap
+    import torch_npu
+    if args.cpu_list:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+        expected = set(parse_ids(args.cpu_list))
+        if set(os.sched_getaffinity(0)) != expected:
+            raise RuntimeError("Runtime changed the worker CPU affinity; controlled NUMA test aborted.")
     run(args)
 
 
