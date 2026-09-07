@@ -1,8 +1,9 @@
 """Linux NUMA experiment helpers. No Torch import and no page migration.
 
 Policies must be installed before importing Torch/CANN so subsequently created
-runtime threads inherit them. move_pages is used with nodes=NULL (query only);
-never dereference an NPU/SVM address on the CPU or move registered DMA pages.
+runtime threads inherit them. move_pages uses nodes=NULL (query only), with a
+read-only pagemap fallback. Never dereference an NPU/SVM address on the CPU or
+move registered DMA pages.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ import tempfile
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
+
+from numa_pagemap import query_pages as query_pagemap_pages
 
 
 POLICIES = ("inherit", "default", "concentrated", "balanced", "interleave", "mapped")
@@ -232,7 +235,48 @@ def mapping_lines(ptr: int, nbytes: int) -> dict:
             starts.add(lo)
     numa = [line for line in Path("/proc/self/numa_maps").read_text().splitlines()
             if int(line.split()[0], 16) in starts]
-    return {"overlapping_maps": maps, "overlapping_numa_maps": numa}
+    report = {"overlapping_maps": maps, "overlapping_numa_maps": numa}
+    if starts:
+        try:
+            report["smaps_vmflags"] = smaps_vmflags(starts)
+        except OSError as error:
+            report["smaps_error"] = str(error)
+    return report
+
+
+def smaps_vmflags(starts: set[int], path: Path = Path("/proc/self/smaps")) -> list[dict]:
+    """Flags describe the VMA, not its actual NUMA placement or buffer size."""
+    result = []
+    current = None
+    with path.open() as file:
+        for line in file:
+            header = re.match(r"^([0-9a-fA-F]+)-[0-9a-fA-F]+\s", line)
+            if header:
+                current = None
+                if int(header[1], 16) in starts:
+                    current = {"mapping": line.rstrip(), "flags": []}
+                    result.append(current)
+            elif current is not None and line.startswith("VmFlags:"):
+                current["flags"] = line.split()[1:]
+    return result
+
+
+def query_residency(api: NumaAPI, addresses: list[int], page_size: int) -> dict:
+    """Keep move_pages evidence; fall back to read-only PFNs if it cannot resolve."""
+    status = None
+    try:
+        status = api.query_pages(addresses)
+        primary = summarize_pages(status)
+    except OSError as error:
+        primary = summarize_pages([-error.errno if error.errno else -errno.EIO] * len(addresses))
+        primary["error"] = str(error)
+    primary["method"] = "move_pages(nodes=NULL, flags=0)"
+    if primary["verified"]:
+        return primary
+    fallback = query_pagemap_pages(addresses, page_size, status)
+    # Never overwrite the failed query or mix two incompatible sample sets.
+    # Consumers use the fallback's own independently checked sample summary.
+    return {**fallback, "move_pages": primary}
 
 
 def prepare_registration_logging() -> dict:
@@ -344,7 +388,7 @@ def inspect_buffer(tensor, sample_count: int, active_rows: list[int], row_bytes:
     page_size = os.sysconf("SC_PAGE_SIZE")
     report = {"tensor_ptr": hex(ptr), "host_ptr": None, "nbytes": nbytes,
               "page_size": page_size, "address_mapping": host_mapping,
-              "method": "move_pages(nodes=NULL); Host VA; no CPU dereference"}
+              "method": "move_pages, then pagemap/Host RAM fallback; no CPU dereference"}
     try:
         if row_bytes <= 0 or any(row < 0 or (row + 1) * row_bytes > nbytes for row in active_rows):
             raise ValueError("Active token rows are outside the source allocation.")
@@ -367,21 +411,35 @@ def inspect_buffer(tensor, sample_count: int, active_rows: list[int], row_bytes:
             raise ValueError("No complete Host VMA for the source. A live registration mapping is required.")
         report["host_ptr"] = hex(host_ptr)
         api = NumaAPI()
-        report["allocation"] = summarize_pages(api.query_pages(
-            sample_addresses(host_ptr, nbytes, sample_count, page_size)))
+        report["allocation"] = query_residency(api,
+            sample_addresses(host_ptr, nbytes, sample_count, page_size), page_size)
         # Query the pages the copy workload actually reads, not just the full
         # allocation. Duplicate pages are retained: counts are token-weighted.
         rows = random.Random(11).sample(active_rows, min(len(active_rows), sample_count))
-        report["active_tokens"] = summarize_pages(api.query_pages(
-            [(host_ptr + row * row_bytes) // page_size * page_size for row in rows])) if rows else None
+        report["active_tokens"] = query_residency(api,
+            [(host_ptr + row * row_bytes) // page_size * page_size for row in rows], page_size) if rows else None
         report["verified"] = report["allocation"]["verified"] and (
             report["active_tokens"] is None or report["active_tokens"]["verified"])
     except (OSError, ValueError) as error:
         report.update(verified=False, error=str(error))
     if not report["verified"]:
-        report["note"] = ("Unverified: no usable live Host mapping was captured, registered pages may not "
-                          "support residency queries, or permissions may block move_pages. "
-                          "Process totals/memory policy alone do NOT prove buffer placement.")
+        errors = {key for sample in (report.get("allocation"), report.get("active_tokens"))
+                  if sample for key in sample.get("page_errors", {})}
+        flags = {flag for vma in report.get("smaps_vmflags", []) for flag in vma["flags"]}
+        if not report["host_ptr"]:
+            report["diagnosis"] = "host_mapping_unresolved"
+        elif "pf" in flags and "PAGEMAP_NOT_PRESENT_OR_HIDDEN" in errors:
+            report["diagnosis"] = "pfnmap_hidden_from_page_query; Linux 5.10 may skip this VMA"
+        elif "PFN_ZERO_OR_REDACTED" in errors:
+            report["diagnosis"] = "pfn_zero_or_redacted; PFN visibility requires appropriate kernel permissions"
+        elif "PHYSICAL_TO_NODE_UNAVAILABLE" in errors:
+            report["diagnosis"] = "pfn_visible_but_physical_node_lookup_unavailable"
+        else:
+            report["diagnosis"] = "host_mapping_resolved_but_page_residency_unverified"
+        report["note"] = ("Host address resolved, but residency evidence is incomplete. Inspect per-sample "
+                          "move_pages errors, pagemap observations and physical-to-node errors. "
+                          if report["host_ptr"] else "No usable complete live Host mapping. ") + (
+                          "Process totals, VMA bind policy and VmFlags do NOT prove buffer placement.")
     return report
 
 

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numa_support as numa
+import numa_pagemap as pagemap
 import benchmark_scatter_copy_numa as bench
 import test_scatter_copy as worker
 import test_scatter_copy_multiprocess as multi
@@ -148,11 +149,13 @@ class ResidencyTests(unittest.TestCase):
 
     def test_svm_query_failure_is_reported_without_cpu_read(self):
         tensor = SimpleNamespace(data_ptr=lambda: 4096, numel=lambda: 2048, element_size=lambda: 2)
-        with patch.object(numa, "mapping_lines", return_value=fake_maps()), patch.object(numa, "NumaAPI") as api:
+        with patch.object(numa, "mapping_lines", return_value=fake_maps()), patch.object(numa, "NumaAPI") as api, \
+                patch.object(numa, "query_pagemap_pages", return_value=pagemap.summarize(["PFN_ZERO_OR_REDACTED"])):
             api.return_value.query_pages.side_effect = OSError(errno.EPERM, "query blocked")
             result = numa.inspect_buffer(tensor, 16, [0], 1024)
         self.assertFalse(result["verified"])
-        self.assertIn("query blocked", result["error"])
+        self.assertIn("query blocked", result["allocation"]["move_pages"]["error"])
+        self.assertIn("PFN_ZERO_OR_REDACTED", result["allocation"]["page_errors"])
 
 
 class HostMappingTests(unittest.TestCase):
@@ -242,13 +245,17 @@ class HostMappingTests(unittest.TestCase):
     def test_host_mapping_does_not_hide_driver_page_query_errors(self):
         svm, host = 0xDFFF91C00000, 0x12C180000000
         tensor = SimpleNamespace(data_ptr=lambda: svm, numel=lambda: 2048, element_size=lambda: 2)
-        with patch.object(numa, "mapping_lines", return_value=fake_maps(host, host + 4096)), \
-                patch.object(numa, "NumaAPI") as api:
+        maps = fake_maps(host, host + 4096) | {"smaps_vmflags": [{"flags": ["io", "pf"]}]}
+        with patch.object(numa, "mapping_lines", return_value=maps), \
+                patch.object(numa, "NumaAPI") as api, \
+                patch.object(numa, "query_pagemap_pages", return_value=pagemap.summarize(["PAGEMAP_NOT_PRESENT_OR_HIDDEN"])):
             api.return_value.query_pages.return_value = [-errno.EFAULT]
             result = numa.inspect_buffer(tensor, 16, [0], 1024, self.mapping())
         self.assertFalse(result["verified"])
         self.assertEqual(result["host_ptr"], hex(host))
-        self.assertEqual(result["allocation"]["page_errors"], {"EFAULT": 1})
+        self.assertEqual(result["allocation"]["move_pages"]["page_errors"], {"EFAULT": 1})
+        self.assertIn("Host address resolved", result["note"])
+        self.assertIn("pfnmap_hidden_from_page_query", result["diagnosis"])
 
     def test_missing_mapping_and_unmapped_svm_is_not_queried(self):
         tensor = SimpleNamespace(data_ptr=lambda: 0xDFFF91C00000, numel=lambda: 2048, element_size=lambda: 2)
@@ -297,6 +304,165 @@ class HostMappingTests(unittest.TestCase):
                 api.assert_not_called()
             self.assertFalse(result["verified"])
             self.assertIn("outside", result["error"])
+
+
+class PagemapTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.memory = self.root / "memory"
+        self.memory.mkdir()
+        (self.memory / "block_size_bytes").write_text("10000\n")
+        self.iomem = self.root / "iomem"
+        self.iomem.write_text("00000000-000bffff : System RAM\n")
+        self.pagemap = self.root / "pagemap"
+        self.pagemap.touch()
+        for block, node in ((0, 0), (1, 4), (10, 7)):
+            root = self.memory / f"memory{block}"
+            root.mkdir()
+            (root / "phys_index").write_text(f"{block:08x}\n")
+            (root / "state").write_text("online\n")
+            (root / f"node{node}").mkdir()
+
+    def entries(self, *entries):
+        # Virtual page 0 is unused; all reads must seek by VA/page_size * 8.
+        self.pagemap.write_bytes(bytes(8) + b"".join(e.to_bytes(8, sys.byteorder) for e in entries))
+
+    def query(self, count, **kwargs):
+        page_size = kwargs.pop("page_size", 4096)
+        addresses = kwargs.pop("addresses", [page_size * (i + 1) for i in range(count)])
+        return pagemap.query_pages(addresses, page_size, pagemap_path=self.pagemap,
+                                   memory_root=self.memory, iomem_path=self.iomem, **kwargs)
+
+    def test_visible_pfns_resolve_nodes_including_hex_block_index(self):
+        self.entries(pagemap.PRESENT | 1, pagemap.PRESENT | 16, pagemap.PRESENT | 160)
+        result = self.query(3)
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["node_pages"], {"0": 1, "4": 1, "7": 1})
+        self.assertEqual(result["pagemap_observations"], {"present": 3, "visible_pfn": 3})
+        buffer = {"verified": True, "allocation": result, "active_tokens": None}
+        self.assertEqual(numa.placement_result({"a": buffer}, "bind", [0]), "policy_mismatch")
+
+    def test_hidden_zero_pfns_are_not_node_zero(self):
+        self.entries(pagemap.PRESENT, 0, pagemap.SWAPPED | 16)
+        with patch.object(pagemap, "PhysicalNodes") as resolver:
+            result = self.query(3)
+            resolver.assert_not_called()
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["node_pages"], {})
+        self.assertEqual(result["page_errors"], {"PFN_ZERO_OR_REDACTED": 1,
+                         "PAGEMAP_NOT_PRESENT_OR_HIDDEN": 1, "PAGEMAP_SWAPPED": 1})
+
+    def test_physical_addresses_must_be_host_system_ram(self):
+        self.entries(pagemap.PRESENT | 1, pagemap.PRESENT | 16)
+        self.iomem.write_text("00000000-00000fff : System RAM\n00001000-0001ffff : device MMIO\n")
+        self.assertEqual(self.query(2)["page_errors"], {"PFN_OUTSIDE_SYSTEM_RAM": 2})
+
+    def test_redacted_or_missing_ram_ranges_fail_closed(self):
+        self.entries(pagemap.PRESENT | 1)
+        for text in ("", "00000000-00000000 : System RAM\n"):
+            self.iomem.write_text(text)
+            result = self.query(1)
+            self.assertFalse(result["verified"])
+            self.assertIn("redacted", result["error"])
+        self.iomem.unlink()
+        self.assertFalse(self.query(1)["verified"])
+
+    def test_offline_or_ambiguous_memory_blocks_are_not_accepted(self):
+        self.entries(pagemap.PRESENT | 16)
+        root = self.memory / "memory1"
+        (root / "state").write_text("offline\n")
+        self.assertEqual(self.query(1)["page_errors"], {"MEMORY_BLOCK_NOT_ONLINE": 1})
+        (root / "state").write_text("online\n")
+        (root / "node5").mkdir()
+        self.assertEqual(self.query(1)["page_errors"], {"MEMORY_BLOCK_NODE_AMBIGUOUS": 1})
+        (root / "phys_index").write_text("00000002\n")
+        self.assertEqual(self.query(1)["page_errors"], {"MEMORY_BLOCK_INDEX_MISMATCH": 1})
+
+    def test_missing_block_and_node_are_not_guessed_from_policy(self):
+        self.entries(pagemap.PRESENT | 32, pagemap.PRESENT | 16)
+        (self.memory / "memory1" / "node4").rmdir()
+        result = self.query(2)
+        self.assertEqual(result["resident_pages"], 0)
+        self.assertEqual(result["sampled_pages"], 2)
+        self.assertIn("MEMORY_BLOCK_NODE_AMBIGUOUS", result["page_errors"])
+        self.assertTrue(any(k.startswith("MEMORY_BLOCK_UNAVAILABLE") for k in result["page_errors"]))
+
+    def test_base_page_size_is_not_hardcoded_4k(self):
+        (self.memory / "block_size_bytes").write_text("100000\n")
+        self.iomem.write_text("00000000-001fffff : System RAM\n")
+        self.entries(pagemap.PRESENT | 1, pagemap.PRESENT | 16)
+        result = self.query(2, page_size=65536)
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["node_pages"], {"0": 1, "4": 1})
+
+    def test_duplicate_active_pages_retain_token_weighting_and_reads_are_read_only(self):
+        self.entries(pagemap.PRESENT | 16)
+        original_open = os.open
+        def read_only(path, flags, *args, **kwargs):
+            self.assertEqual(flags & os.O_ACCMODE, os.O_RDONLY)
+            self.assertEqual(Path(path), self.pagemap)
+            return original_open(path, flags, *args, **kwargs)
+        with patch.object(pagemap.os, "open", side_effect=read_only), \
+                patch.object(pagemap.os, "pread", wraps=os.pread) as pread:
+            result = self.query(3, addresses=[4096] * 3)
+            self.assertEqual(pread.call_count, 1)
+            self.assertEqual(pread.call_args.args[1:], (8, 8))
+        self.assertEqual(result["node_pages"], {"4": 3})
+        self.assertEqual(result["sampled_pages"], 3)
+
+    def test_short_read_and_permissions_preserve_partial_evidence(self):
+        self.entries(pagemap.PRESENT | 1)
+        result = self.query(2)
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["node_pages"], {"0": 1})
+        self.assertEqual(result["page_errors"], {"PAGEMAP_SHORT_READ": 1})
+        with patch.object(pagemap.os, "open", side_effect=PermissionError(errno.EACCES, "denied")):
+            result = self.query(2)
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["sampled_pages"], 2)
+        self.assertIn("denied", result["error"])
+
+    def test_cross_check_disagreement_fails_closed(self):
+        self.entries(pagemap.PRESENT | 1, pagemap.PRESENT | 16)
+        result = self.query(2, expected_nodes=[0, 0])
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["page_errors"], {"RESIDENCY_CHANGED_OR_INCONSISTENT": 1})
+        self.assertTrue(self.query(2, expected_nodes=[0, -errno.EFAULT])["verified"])
+
+    def test_invalid_sample_inputs(self):
+        for addresses in ([0], [-4096], [4097]):
+            with self.assertRaises(ValueError):
+                self.query(1, addresses=addresses)
+        with self.assertRaises(ValueError):
+            self.query(1, expected_nodes=[])
+        self.assertFalse(self.query(0)["verified"])
+
+    def test_fallback_only_when_primary_cannot_resolve(self):
+        api = Mock()
+        api.query_pages.return_value = [0, 4]
+        with patch.object(numa, "query_pagemap_pages") as fallback:
+            result = numa.query_residency(api, [4096, 8192], 4096)
+            fallback.assert_not_called()
+        self.assertTrue(result["verified"])
+        api.query_pages.return_value = [0, -errno.EFAULT]
+        with patch.object(numa, "query_pagemap_pages", return_value=pagemap.summarize([0, 4])) as fallback:
+            result = numa.query_residency(api, [4096, 8192], 4096)
+            fallback.assert_called_once_with([4096, 8192], 4096, [0, -errno.EFAULT])
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["move_pages"]["page_errors"], {"EFAULT": 1})
+
+    def test_smaps_vmflags_are_diagnostic_not_node_evidence(self):
+        path = self.root / "smaps"
+        path.write_text("1000-2000 rw-p 00000000 00:00 0\nSize: 4 kB\nVmFlags: rd wr\n"
+                        "100000000000-180000000000 rw-s 00000000 00:8c 103 /dev/davinci_manager\n"
+                        "Size: 8589934592 kB\nVmFlags: rd wr sh io pf\n"
+                        "dfff00000000-e00000000000 rw-p 00000000 00:00 0\nVmFlags: rd wr\n")
+        result = numa.smaps_vmflags({0x100000000000}, path)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["flags"], ["rd", "wr", "sh", "io", "pf"])
+        self.assertNotIn("node_pages", result[0])
 
 
 class HarnessTests(unittest.TestCase):
@@ -387,6 +553,22 @@ class HarnessTests(unittest.TestCase):
         result = bench.placement_load(result)
         self.assertEqual(result["estimated_source_bytes_per_node"], {"0": 8192, "1": 1024})
         self.assertEqual(result["estimated_read_bytes_per_node_per_iteration"], {"0": 4096, "1": 512})
+
+    def test_trial_failure_prints_buffer_diagnostics_and_worker_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "workers").mkdir()
+            (root / "launcher.log").write_text("RuntimeError: inspect worker log\n")
+            (root / "workers" / "rank0_device0.log").write_text(
+                'A3_SCATTER_NUMA_BUFFER {"verified": false, "page_errors": {"PFN_ZERO_OR_REDACTED": 1}}\n'
+                'A3_SCATTER_NUMA_PLACEMENT ' + 'x' * 10000 + '\n'
+                'RuntimeError: Swapped source placement is unverified\n')
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                bench.print_failure_logs(root)
+        self.assertIn("PFN_ZERO_OR_REDACTED", output.getvalue())
+        self.assertIn("Swapped source placement is unverified", output.getvalue())
+        self.assertLess(len(output.getvalue()), 4000)
 
 
 if __name__ == "__main__":

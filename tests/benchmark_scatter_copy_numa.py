@@ -17,7 +17,7 @@ import platform
 import statistics
 import subprocess
 import sys
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 
@@ -123,6 +123,29 @@ def save_inventory(path):
     path.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
 
+def print_failure_logs(trial: Path):
+    """Print bounded evidence from this trial, without hiding its full log files."""
+    paths = [trial / "launcher.log", *sorted((trial / "workers").glob("*.log"))]
+    for path in paths:
+        print(f"SCATTER_NUMA_FAILURE_LOG file={path}", flush=True)
+        try:
+            tail = deque(maxlen=8)
+            with path.open(encoding="utf-8", errors="replace") as file:
+                for line in file:
+                    # The compact per-buffer record includes both query methods;
+                    # don't flood the console with the full placement JSON again.
+                    if line.startswith(("A3_SCATTER_NUMA_SETUP ", "A3_SCATTER_NUMA_ADDRESS_CAPTURE ",
+                                        "A3_SCATTER_NUMA_BUFFER ")):
+                        print(line.rstrip(), flush=True)
+                    else:
+                        tail.append(line)
+            for line in tail:
+                text = line.rstrip()
+                print(text if len(text) <= 2000 else text[:2000] + " ... [see full log]", flush=True)
+        except OSError as error:
+            print(f"Cannot read failure log: {error}", flush=True)
+
+
 def main():
     args = parse_args()
     if os.getenv("ASCEND_LAUNCH_BLOCKING", "0") != "0":
@@ -165,7 +188,8 @@ def main():
                     process.wait()
                     raise
             if code:
-                raise RuntimeError(f"NUMA trial failed ({code}); see {trial}/launcher.log and workers/*.log")
+                print_failure_logs(trial)
+                raise RuntimeError(f"NUMA trial failed ({code}); see {trial}/launcher.log and {trial}/workers/*.log")
             result = json.loads((trial / "result.json").read_text())
             summary = result["summary"]
             row = {"case": label, "round": repeat + 1, "devices": ",".join(map(str, subset)),

@@ -489,12 +489,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         status = placement_result(buffers, args.memory_policy, nodes)
         numa = {**(numa or {}), "placement_status": status, "buffers": buffers}
         for name, buffer in buffers.items():
+            allocation = buffer.get("allocation", {})
             print("A3_SCATTER_NUMA_BUFFER " + json.dumps({
                 "name": name, "tensor_ptr": buffer["tensor_ptr"], "host_ptr": buffer["host_ptr"],
                 "verified": buffer["verified"],
-                "node_pages": buffer.get("allocation", {}).get("node_pages", {}),
-                "page_errors": buffer.get("allocation", {}).get("page_errors", {}),
-                "error": buffer.get("error"),
+                "diagnosis": buffer.get("diagnosis"),
+                "method": allocation.get("method"),
+                "vm_flags": [v["flags"] for v in buffer.get("smaps_vmflags", [])],
+                "node_pages": allocation.get("node_pages", {}),
+                "page_errors": allocation.get("page_errors", {}),
+                "move_pages_errors": allocation.get("move_pages", {}).get("page_errors", {}),
+                "pagemap_observations": allocation.get("pagemap_observations", {}),
+                "error": buffer.get("error") or allocation.get("error"),
             }, sort_keys=True), flush=True)
         print("A3_SCATTER_NUMA_PLACEMENT " + json.dumps(numa, sort_keys=True), flush=True)
         if args.require_numa_placement and status != "sample_verified":

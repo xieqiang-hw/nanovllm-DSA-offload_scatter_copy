@@ -141,7 +141,9 @@ CPU 与内存策略分开控制：默认 `--cpu-bind spread --cpus-per-worker 4`
 - `move_pages(..., nodes=NULL, flags=0)` **只查询，不迁移、不解引用 NPU 指针、不修改已注册 DMA 页**。
 - NUMA probe 会在导入 Torch/CANN 前将该 worker 的日志级别设为 WARNING、启用日志打屏。在本次 source 分配期间临时捕获原生 stdout/stderr，从 `torch_npu::registerSvmMem` 的 warning 中读取 `svmPtr → alignedPtr` 映射，随后原样重放捕获的日志。只采信当前 PID、与活跃 tensor 地址完全一致且无冲突的记录；不会读取旧 PLOG、硬编码上次运行的地址、按 VMA 大小猜测地址，也不修改/替换分配器。采集在 warmup/计时之前完成，各策略使用相同日志配置；不启用 NUMA probe 的旧测试不改变日志配置。
 - `alignedPtr` 是注册区域的真实 Host 起点，页采样和实际 copy token 的偏移均基于此地址。查询前要求 `/proc/self/maps` 覆盖整个 Host buffer；如果驱动使用相同 Host/NPU VA，也支持在完整 Host VMA 上直接查询 tensor 地址。**有地址映射不等于页位置已经验证。**
-- 如果当前运行未捕获可用映射、驱动 Host 映射无法查询、系统不允许 `move_pages`，结果明确标记 `unverified`，保存相关 `/proc/self/maps`、`numa_maps` 行和错误码。此时设置成功也不能证明实际 source 被集中或均衡分配。采集依赖该版本 Torch 的 warning 格式，未来版本若改变格式或没有及时打屏，不会猜测后继续声称验证成功。
+- 若 `move_pages` 无法解析，保留原始错误并尝试只读后备查询：读取当前进程 `/proc/self/pagemap` 的 sampled Host VA 页表项，检查 PFN 非零且 present，再确认其物理页属于 `/proc/iomem` 的 System RAM、对应 sysfs memory block 为 online 且唯一归属一个 NUMA node。不会把设备物理地址、缺失/遮蔽的 PFN、离线块或多节点块猜成 Host node；原查询部分成功时，两个方法的已知节点也必须一致。后备查询独立验证全部样本，不拼凑不同样本的计数。仅读取元数据，不读取 `/proc/self/mem`、不触碰 buffer 内容、不改权限、不迁移页、不改变分配器。
+- **后备方法也可能不可用。** [Linux pagemap 文档](https://www.kernel.org/doc/html/v5.10/admin-guide/mm/pagemap.html) 说明，缺少所需 `CAP_SYS_ADMIN` 权限时 PFN 会被隐藏；而 [Linux 5.10 pagewalk](https://github.com/torvalds/linux/blob/v5.10/mm/pagewalk.c) 对 `PFNMAP` VMA 可能直接按 hole 处理，即使 root 也读不到实际页。脚本保存相关 `/proc/self/maps`、`numa_maps` 和 `smaps` 的 `VmFlags`（`pf` 表示 PFNMAP）用于区分原因。`pagemap` 未返回 present 不证明驱动 buffer 没有物理内存，`resident_pages=0` 也只表示查询未解析到节点。
+- 如果未捕获可用映射或两种页查询仍不完整，结果保持 `unverified`。例如 `100000000000 bind:0 file=/dev/davinci_manager` 只显示整段驱动 VMA 的策略，没有 `N0=...` 等实际页计数，**不能证明 source 分配在 node0**。如果确认是驱动映射不可见，应继续调查匹配版本的驱动查询接口，不放宽严格校验、不通过 CPU 强行读取/迁移已注册页解决。地址采集依赖该版本 Torch 的 warning 格式，未来版本改变格式或未及时打屏时不会猜测后声称验证成功。
 - `sample_verified` 只表示抽样成功且符合指定节点，不是全量页扫描。`policy_mismatch` 表示已查到页却落在指定节点外；`interleave_not_observed` 表示样本未覆盖全部指定节点。可加 `--require-numa-placement`，要求验证通过后才能计时；默认保留诊断和时延，即使页位置未验证。
 - `SCATTER_NUMA_NODE_LOAD` 根据样本打印按字节加权的 source 容量、实际 copy 读负载分布估计值；未验证时为 `null`，不会编造节点负载。
 
@@ -203,4 +205,6 @@ python3 tests/benchmark_scatter_copy_numa.py \
   --require-numa-placement
 ```
 
-worker 日志中的 `A3_SCATTER_NUMA_ADDRESS_CAPTURE` 显示采集的映射数；`A3_SCATTER_NUMA_BUFFER` 分别打印 CKV/KPE 的 `tensor_ptr`、`host_ptr`、`node_pages`、`page_errors` 和 `verified`。只有最终 `placement_status=sample_verified` 才进入正式对照；如果转换成功但 Host 页仍返回 `EFAULT`，保留严格校验，将完整 `A3_SCATTER_NUMA_PLACEMENT` 贴出，再调查驱动映射的可查询性。这里的 10 次迭代只用于诊断，不用于判断性能或 NUMA 收益。
+worker 日志中的 `A3_SCATTER_NUMA_ADDRESS_CAPTURE` 显示采集的映射数；`A3_SCATTER_NUMA_BUFFER` 分别打印 CKV/KPE 的 Host/SVM 地址、`vm_flags`、所用查询 `method`、两种查询的错误、`pagemap_observations`、`node_pages`、`diagnosis` 和 `verified`。外层实验失败时会直接重放当前 worker 的这些摘要和异常末尾，不必再逐层找日志；完整证据仍保存于 `A3_SCATTER_NUMA_PLACEMENT`。
+
+只有最终 `placement_status=sample_verified` 才进入正式对照。保持 `--require-numa-placement`：如果出现 `pf` 且 `PAGEMAP_NOT_PRESENT_OR_HIDDEN`，或 `PFN_ZERO_OR_REDACTED`，请贴出新的摘要，不要反复执行相同命令、去掉校验或据此判断 NUMA 好坏。这里的 10 次迭代只用于诊断，不用于判断性能或 NUMA 收益。本次只改 Python 探针，无需重新编译 SCATTER。
