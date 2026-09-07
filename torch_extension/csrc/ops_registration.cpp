@@ -1,13 +1,13 @@
 #include <torch/extension.h>
 #include <torch/library.h>
 
-TORCH_LIBRARY(nanovllm_dsa, m) {
+TORCH_LIBRARY(vllm_dsa_a5, m) {
   m.def(
-      "kvcache_scatter_copy(Tensor(a!) hbm_kpe, Tensor(b!) hbm_ckv, "
-      "Tensor dram_kpe, Tensor dram_ckv, Tensor hbm_block_table, "
-      "Tensor dram_block_table, Tensor source_token_ids, "
-      "Tensor destination_slots, Tensor copy_counts) "
-      "-> (Tensor(a!), Tensor(b!))");
+      "kvcache_scatter_copy_c8(Tensor(a!) hbm_kv_bytes, "
+      "Tensor dram_kv_bytes, "
+      "Tensor hbm_block_table, Tensor dram_block_table, "
+      "Tensor source_token_ids, Tensor destination_slots, "
+      "Tensor copy_counts) -> ()");
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

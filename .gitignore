@@ -3,8 +3,9 @@ _custom_opp_bf16/
 _custom_opp_c8/
 build/
 torch_extension/build/
-torch_extension/nanovllm_dsa_a5/_C*.so
+torch_extension/*/_C*.so
 __pycache__/
 *.pyc
 
 runlog/
+results/
