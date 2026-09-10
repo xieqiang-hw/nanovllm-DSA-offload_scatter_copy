@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -14,24 +13,28 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scatter_cli import add_copy_count_arg, add_device_args, resolve_copy_count, selected_devices, validate_workload
+from scatter_results import copy_label, print_result, summarize_devices
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--devices", default="0,1,2,3,4,5,6,7")
-    parser.add_argument("--output", type=Path, required=True)
+    add_device_args(parser, "0")
+    parser.add_argument("--output", type=Path, help="Case JSON path (default: branch results directory).")
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--source-len", type=int, default=65536)
-    parser.add_argument("--hbm-slots", type=int, default=4096)
+    parser.add_argument("--hbm-slots", type=int, default=8192)
+    add_copy_count_arg(parser)
     parser.add_argument("--copy-min", type=int, default=0)
     parser.add_argument("--copy-max", type=int, default=300)
     parser.add_argument("--copy-cap", type=int, default=2048)
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--same-seed", action="store_true")
     parser.add_argument("--allow-non-a5", action="store_true")
-    return parser.parse_args()
+    return resolve_copy_count(parser.parse_args())
 
 
 def parse_devices(value: str) -> list[int]:
@@ -77,7 +80,8 @@ def wait_until_ready(
 
 def main() -> None:
     args = parse_args()
-    devices = parse_devices(args.devices)
+    validate_workload(args)
+    devices = selected_devices(args)
     worker_script = Path(__file__).with_name("test_kvcache_scatter_copy.py")
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -150,15 +154,11 @@ def main() -> None:
             result["logical_device_index"] = device
             per_device.append(result)
 
-    latencies = [float(item["performance"]["avg_us"]) for item in per_device]
-    bandwidths = [float(item["performance"]["payload_gbps"]) for item in per_device]
     payload_bytes = [int(item["workload"]["payload_bytes_per_iteration"]) for item in per_device]
     copied_tokens = [int(item["workload"]["copied_tokens"]) for item in per_device]
-    avg_us_max = max(latencies)
     total_payload_bytes = sum(payload_bytes)
-    conservative_gbps = total_payload_bytes / (avg_us_max * 1000.0) if total_payload_bytes and avg_us_max else 0.0
     output = {
-        "schema_version": 1,
+        "schema_version": 2,
         "test": "a5_kvcache_scatter_copy_multiprocess",
         "status": "passed",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -175,11 +175,7 @@ def main() -> None:
             "allow_non_a5": args.allow_non_a5,
         },
         "summary": {
-            "avg_us_min": min(latencies),
-            "avg_us_mean": statistics.fmean(latencies),
-            "avg_us_max": avg_us_max,
-            "payload_gbps_sum": sum(bandwidths),
-            "payload_gbps_sum_by_avg_us_max": conservative_gbps,
+            **summarize_devices(per_device),
             "total_payload_bytes_per_iteration": total_payload_bytes,
             "copied_tokens_sum_per_iteration": sum(copied_tokens),
             "all_correct": True,
@@ -187,14 +183,8 @@ def main() -> None:
         "per_device": per_device,
     }
     write_json(args.output, output)
-    print(
-        "A5_SCATTER_MULTIPROCESS_RESULT "
-        f"cards={len(devices)} avg_us_mean={statistics.fmean(latencies):.3f} "
-        f"avg_us_max={avg_us_max:.3f} payload_gbps_sum={sum(bandwidths):.3f} "
-        f"payload_gbps_sum_by_avg_us_max={conservative_gbps:.3f} "
-        f"output={args.output}",
-        flush=True,
-    )
+    print_result({"cards": len(devices), "batch_size": args.batch_size,
+                  "copy_count": copy_label(vars(args)), **summarize_devices(per_device)})
     print("A5_KVCACHE_SCATTER_COPY_MULTIPROCESS_UT_OK", flush=True)
 
 
