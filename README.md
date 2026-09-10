@@ -55,6 +55,8 @@ export PYTHONPATH="$PWD/torch_extension${PYTHONPATH:+:$PYTHONPATH}"
 
 构建自动识别 SoC，一次包含 BF16/C8，产物保存在 `build/<soc>/`。显式指定目标可用 `SOC_VERSION=ascend910_93 bash build.sh` 或 `SOC_VERSION=ascend950 bash build.sh`；不同架构的机器分别编译。Python 包只加载当前仓库中匹配本机 SoC 的 OPP。`PYTHON`、`MAX_JOBS` 仅配置构建解释器和并行度。
 
+看到最后的 `Build complete: ...` 才表示 OPP 已打包、安装且 Python 扩展已生成；仅出现 `Built target cust_opapi` 尚未完成。重跑 `bash build.sh` 会重新生成本目标的工程。
+
 ## 单 die 验证
 
 ```bash
@@ -92,4 +94,4 @@ data-type  card-count  batch-size  copy-count  avg_us_mean  avg_us_max  avg_band
 - `avg_bandwidth = sum(P_i / (t_i * 1000))`，单位 GB/s；不将读写流量翻倍。
 - `P_i = batch_size * copy_count * bytes_per_token`；BF16 为 1152，C8 为 656；零拷贝带宽为 0。
 
-硬件验收需覆盖四种组合。与原三个分支做性能回归时，用同一套独立源池输入、copy-cap、设备绑定、预热和计时条件交替测量至少五轮；历史 A5 表格采用共享源池，需在统一输入下重跑旧算子。存在可复现的性能下降时继续修复，通过后再删除旧分支。CPU 工具检查命令：`python3 -m unittest discover -s tests -p 'test_scatter_tools.py'`；它不替代 CANN 编译和 NPU 实测。
+硬件验收需覆盖四种组合。与原三个分支做性能回归时，用同一套独立源池输入、copy-cap、设备绑定、预热和计时条件交替测量至少五轮；历史 A5 表格采用共享源池，需在统一输入下重跑旧算子。存在可复现的性能下降时继续修复，通过后再删除旧分支。CPU 工具检查命令：`python3 -m unittest discover -s tests -p 'test_*.py'`；它不替代 CANN 编译和 NPU 实测。

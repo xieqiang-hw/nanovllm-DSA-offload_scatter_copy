@@ -5,9 +5,12 @@ from ._soc import detect_soc
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SOC = detect_soc()
-_LIBS = list((_ROOT / "build" / _SOC / "opp" / "vendors").glob("*/op_api/lib/libcust_opapi.so"))
+_OPP = _ROOT / "build" / _SOC / "opp"
+_LIBS = list((_OPP / "vendors").glob("*/op_api/lib/libcust_opapi.so"))
 if len(_LIBS) != 1:
-    raise RuntimeError(f"Run bash build.sh on this {_SOC} machine first.")
+    raise RuntimeError(f"Local OPP is missing or ambiguous at {_OPP}. Run bash build.sh to 'Build complete'; PYTHONPATH alone does not install it.")
+if not list(Path(__file__).parent.glob("_C*.so")):
+    raise RuntimeError("Torch extension is missing. Run bash build.sh to 'Build complete'.")
 _OPAPI = _LIBS[0].resolve()
 _VENDOR = _OPAPI.parents[2]
 os.environ["ASCEND_CUSTOM_OPP_PATH"] = str(_VENDOR)
