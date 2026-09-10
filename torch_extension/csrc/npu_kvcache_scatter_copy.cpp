@@ -1,5 +1,6 @@
 #include <limits>
 #include <tuple>
+#include <type_traits>
 #include <torch/extension.h>
 #include <torch/library.h>
 #include "op_api_common.h"
@@ -52,7 +53,7 @@ void CheckInputs(
 }
 
 void Scatter(
-    at::Tensor hbm, const at::Tensor& dram, const OptionalTensor& hbmKpe,
+    const at::Tensor& hbm, const at::Tensor& dram, const OptionalTensor& hbmKpe,
     const OptionalTensor& dramKpe, const at::Tensor& hbmTable, const at::Tensor& dramTable,
     const at::Tensor& src, const at::Tensor& dst, const at::Tensor& counts)
 {
@@ -67,6 +68,9 @@ void Scatter(
     EXEC_NPU_CMD_ORDERED(aclnnKvcacheScatterCopy, keepalive,
                         hbm, dram, apiHbmKpe, apiDramKpe, hbmTable, dramTable, src, dst, counts);
 }
+
+static_assert(std::is_same_v<decltype(&Scatter), decltype(&CheckInputs)>,
+              "PrivateUse1 and Meta kernels must have identical C++ signatures.");
 } // namespace
 
 TORCH_LIBRARY_IMPL(kvcache_ops, PrivateUse1, m) { m.impl("kvcache_scatter_copy", &Scatter); }
