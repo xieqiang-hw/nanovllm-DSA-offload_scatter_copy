@@ -8,41 +8,39 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+
 #include "op_api_common.h"
+#include <cstring>
 
-const std::vector<std::string> g_custom_lib_path = get_custom_lib_path();
-const std::vector<std::string> g_default_custom_lib_path = get_default_custom_lib_path();
-
-void *GetOpApiFuncAddrFromFeatureLib(const char *api_name)
+void* GetOpApiFuncAddr(const char* name)
 {
-    GET_OP_API_FUNC_FROM_FEATURE_LIB(ops_infer_handler, "libaclnn_ops_infer.so", api_name);
-    GET_OP_API_FUNC_FROM_FEATURE_LIB(ops_train_handler, "libaclnn_ops_train.so", api_name);
-    GET_OP_API_FUNC_FROM_FEATURE_LIB(math_handler, "libaclnn_math.so", api_name);
-    GET_OP_API_FUNC_FROM_FEATURE_LIB(sparse_handler, "libaclnn_sparse.so", api_name);
-    GET_OP_API_FUNC_FROM_FEATURE_LIB(fft_handler, "libaclnn_fft.so", api_name);
-    GET_OP_API_FUNC_FROM_FEATURE_LIB(rand_handler, "libaclnn_rand.so", api_name);
-    return nullptr;
+    static void* custom = [] {
+        const char* path = std::getenv("SCATTER_OPAPI_LIB");
+        TORCH_CHECK(path, "Import kvcache_ops before calling scatter.");
+        void* handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+        TORCH_CHECK(handle, "Cannot load ", path, ": ", dlerror());
+        return handle;
+    }();
+    if (void* function = dlsym(custom, name)) return function;
+    // Never pick a same-named scatter operator out of another installed OPP.
+    TORCH_CHECK(std::strncmp(name, "aclnnKvcacheScatterCopy", 23) != 0,
+                "The local OPP is missing ", name, ". Rebuild with bash build.sh.");
+    static const std::vector<void*> libraries = [] {
+        std::vector<void*> result;
+        for (const char* library : {"libopapi.so", "libaclnn_ops_infer.so", "libaclnn_ops_train.so",
+             "libaclnn_math.so", "libopapi_math.so", "libopapi_nn.so", "libopapi_cv.so",
+             "libopapi_transformer.so", "libopapi_legacy.so"})
+            if (void* handle = dlopen(library, RTLD_LAZY | RTLD_LOCAL)) result.push_back(handle);
+        return result;
+    }();
+    for (void* library : libraries)
+        if (void* function = dlsym(library, name)) return function;
+    return dlsym(RTLD_DEFAULT, name);
 }
 
-c10::SmallVector<int64_t, SIZE> array_to_small_vector(c10::IntArrayRef shape)
+AclUseStreamResFunc GetUseStreamResFuncCoreNum()
 {
-    c10::SmallVector<int64_t, SIZE> shape_small_vec;
-    for (uint64_t i = 0; i < shape.size(); i++) {
-        shape_small_vec.emplace_back(shape[i]);
-    }
-
-    return shape_small_vec;
-}
-
-const c10::optional<at::Tensor> get_valid_tensor(const c10::optional<at::Tensor> &tensor_opt, at::Device device) {
-    return tensor_opt.has_value() ? tensor_opt : torch::empty({0}, torch::dtype(torch::kInt32).device(device));
-};
-
-AclUseStreamResFunc GetUseStreamResFuncCoreNum() {
-    void* libacl_handle = dlopen("libascendcl.so", RTLD_NOW);
-    if (libacl_handle != nullptr) {
-        AclUseStreamResFunc LocalUseStreamRes = reinterpret_cast<AclUseStreamResFunc>(dlsym(libacl_handle, "aclrtUseStreamResInCurrentThread"));
-        return LocalUseStreamRes;
-    }
-    return nullptr;
+    static void* library = dlopen("libascendcl.so", RTLD_LAZY | RTLD_LOCAL);
+    return library ? reinterpret_cast<AclUseStreamResFunc>(
+        dlsym(library, "aclrtUseStreamResInCurrentThread")) : nullptr;
 }

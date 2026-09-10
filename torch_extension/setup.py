@@ -18,15 +18,15 @@ if USE_NINJA:
     verify_ninja_availability()
 
 setup(
-    name="vllm_dsa_a5",
+    name="kvcache_ops",
     version="0.1.0",
     packages=find_packages(),
     ext_modules=[
         NpuExtension(
-            name="vllm_dsa_a5._C",
+            name="kvcache_ops._C",
             sources=[
                 str(CSRC / "ops_registration.cpp"),
-                str(CSRC / "npu_kvcache_scatter_copy_c8.cpp"),
+                str(CSRC / "npu_kvcache_scatter_copy.cpp"),
                 str(CSRC / "op_api_common.cpp"),
             ],
             include_dirs=[str(CSRC)],

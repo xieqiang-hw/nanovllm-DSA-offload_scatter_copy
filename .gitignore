@@ -1,11 +1,9 @@
-_custom_opp/
-_custom_opp_bf16/
-_custom_opp_c8/
 build/
+_custom_opp*/
+results/
+runlog/
 torch_extension/build/
 torch_extension/*/_C*.so
+torch_extension/*.egg-info/
 __pycache__/
 *.pyc
-
-runlog/
-results/
