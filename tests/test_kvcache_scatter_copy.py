@@ -10,13 +10,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Select this checkout's custom OPP before initializing torch_npu.
-import vllm_dsa_a5
-import torch
-import torch_npu  # type: ignore  # noqa: F401
+from scatter_cli import resolve_copy_count
+from scatter_results import print_result, single_result
+
 
 from _common import BLOCK_SIZE, COPY_CAP, ROW_BYTES, add_case_args, validate_args, write_json
-from _utils import require_a5, swapped_from_cpu
 
 POISON = 65
 
@@ -47,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json-output", type=Path)
     for name in ("ready-file", "start-file", "timing-ready-file", "timing-start-file"):
         parser.add_argument(f"--{name}", type=Path, help=argparse.SUPPRESS)
-    return parser.parse_args()
+    return resolve_copy_count(parser.parse_args())
 
 
 def make_case(args: argparse.Namespace) -> Case:
@@ -207,16 +205,9 @@ def run(args: argparse.Namespace) -> dict:
     end.synchronize()
     avg_us = start.elapsed_time(end) * 1000 / args.iters
     assert_copied(case)
-    payload_gbps = payload_bytes / (avg_us * 1000) if payload_bytes and avg_us else 0.0
-    print(
-        f"A5_KVCACHE_SCATTER_COPY_C8_RESULT dtype=c8 row_bytes={ROW_BYTES} "
-        f"copy_min={args.copy_min} copy_max={args.copy_max} copied_tokens={copied_tokens} "
-        f"avg_us={avg_us:.3f} payload_gbps={payload_gbps:.3f} "
-        f"timer=npu_event warmup={args.warmup} iters={args.iters} performance_assertion=0",
-        flush=True,
-    )
+    print_result(single_result(args, payload_bytes, avg_us))
     result = {
-        "schema_version": 1, "test": "a5_kvcache_scatter_copy_c8_singlecard",
+        "schema_version": 2, "test": "a5_kvcache_scatter_copy_c8_singlecard",
         "status": "passed", "timestamp_utc": datetime.now(timezone.utc).isoformat(), "device_count": 1,
         "config": {
             "device": str(case.device), "device_name": case.device_name,
@@ -234,7 +225,8 @@ def run(args: argparse.Namespace) -> dict:
             "data_exact": True, "caller_owned": True, "guard_unchanged": True,
             "zero_count_unchanged": True, "first_fill_capacity": True,
         },
-        "performance": {"timer": "npu_event", "avg_us": avg_us, "payload_gbps": payload_gbps},
+        "summary": single_result(args, payload_bytes, avg_us),
+        "performance": {"timer": "npu_event", "avg_us": avg_us},
     }
     if args.json_output is not None:
         write_json(args.json_output, result)
@@ -245,6 +237,12 @@ def run(args: argparse.Namespace) -> dict:
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    global torch, torch_npu, vllm_dsa_a5, require_a5, swapped_from_cpu
+    # Select this checkout's OPP before torch_npu initializes.
+    import vllm_dsa_a5
+    import torch
+    import torch_npu
+    from _utils import require_a5, swapped_from_cpu
     torch.set_num_threads(1)
     run(args)
 

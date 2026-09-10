@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 
+from scatter_cli import add_copy_count_arg
+
 BLOCK_SIZE = 128
 ROW_BYTES = 656
 COPY_CAP = 16384
@@ -18,6 +20,7 @@ def add_case_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--source-len", type=int, default=65536)
     parser.add_argument("--hbm-slots", type=int, default=8192)
+    add_copy_count_arg(parser)
     parser.add_argument("--copy-min", type=int, default=0)
     parser.add_argument("--copy-max", type=int, default=300)
     parser.add_argument("--copy-cap", type=int, default=COPY_CAP, help="C8 ABI: fixed at 16384, not the number of copies.")

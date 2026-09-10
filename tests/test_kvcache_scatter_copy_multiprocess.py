@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -14,16 +13,19 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scatter_cli import add_device_args, resolve_copy_count, selected_devices, validate_workload
+from scatter_results import copy_label, print_result, summarize_devices
+
 from _common import ROW_BYTES, add_case_args, validate_args, write_json
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     add_case_args(parser)
-    parser.add_argument("--devices", default="0,1,2,3,4,5,6,7", help="Logical NPU indices within ASCEND_RT_VISIBLE_DEVICES.")
-    parser.add_argument("--output", type=Path, required=True)
+    add_device_args(parser, "0")
+    parser.add_argument("--output", type=Path, help="Case JSON path (default: branch results directory).")
     parser.add_argument("--same-seed", action="store_true")
-    return parser.parse_args()
+    return resolve_copy_count(parser.parse_args())
 
 
 def parse_devices(value: str) -> list[int]:
@@ -116,13 +118,10 @@ def run_workers(args: argparse.Namespace, devices: list[int]) -> list[dict]:
 
 
 def summarize(args: argparse.Namespace, devices: list[int], per_device: list[dict]) -> dict:
-    latencies = [float(item["performance"]["avg_us"]) for item in per_device]
-    bandwidths = [float(item["performance"]["payload_gbps"]) for item in per_device]
     total_bytes = sum(int(item["workload"]["payload_bytes_per_iteration"]) for item in per_device)
     total_tokens = sum(int(item["workload"]["copied_tokens"]) for item in per_device)
-    maximum = max(latencies)
     return {
-        "schema_version": 1, "test": "a5_kvcache_scatter_copy_c8_multiprocess",
+        "schema_version": 2, "test": "a5_kvcache_scatter_copy_c8_multiprocess",
         "status": "passed", "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
         "device_count": len(devices), "devices": devices, "same_seed": args.same_seed,
@@ -134,9 +133,7 @@ def summarize(args: argparse.Namespace, devices: list[int], per_device: list[dic
             "allow_non_a5": args.allow_non_a5,
         },
         "summary": {
-            "avg_us_min": min(latencies), "avg_us_mean": statistics.fmean(latencies), "avg_us_max": maximum,
-            "payload_gbps_sum": sum(bandwidths),
-            "payload_gbps_sum_by_avg_us_max": total_bytes / (maximum * 1000) if total_bytes and maximum else 0.0,
+            **summarize_devices(per_device),
             "total_payload_bytes_per_iteration": total_bytes,
             "copied_tokens_sum_per_iteration": total_tokens, "all_correct": True,
         },
@@ -147,7 +144,8 @@ def summarize(args: argparse.Namespace, devices: list[int], per_device: list[dic
 def main() -> None:
     args = parse_args()
     validate_args(args)
-    devices = parse_devices(args.devices)
+    validate_workload(args)
+    devices = selected_devices(args)
     # Invalidate a previous successful result if this rerun subsequently fails.
     write_json(args.output, {"status": "running", "devices": devices})
     try:
@@ -156,14 +154,9 @@ def main() -> None:
         write_json(args.output, {"status": "failed", "devices": devices, "error": str(error)})
         raise
     write_json(args.output, output)
-    summary = output["summary"]
-    print(
-        f"A5_SCATTER_C8_MULTIPROCESS_RESULT cards={len(devices)} "
-        f"avg_us_mean={summary['avg_us_mean']:.3f} avg_us_max={summary['avg_us_max']:.3f} "
-        f"payload_gbps_sum={summary['payload_gbps_sum']:.3f} "
-        f"payload_gbps_sum_by_avg_us_max={summary['payload_gbps_sum_by_avg_us_max']:.3f} output={args.output}",
-        flush=True,
-    )
+    print_result({"cards": len(devices), "batch_size": args.batch_size,
+                  "copy_count": copy_label(vars(args)), **{key: output["summary"][key]
+                      for key in ("avg_us_mean", "avg_us_max", "avg_bandwidth")}})
     print("A5_KVCACHE_SCATTER_COPY_C8_MULTIPROCESS_UT_OK", flush=True)
 
 
