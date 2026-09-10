@@ -18,8 +18,7 @@ static bool CacheShape(const gert::Shape& s, int64_t width)
 static ge::graphStatus TilingScatter(gert::TilingContext* context)
 {
     if (!context || !context->GetPlatformInfo()) return ge::GRAPH_FAILED;
-    // IR indices must be used here: absent optional RoPE inputs precede metadata.
-    for (size_t i : {0U, 1U, 4U, 5U, 6U, 7U, 8U}) {
+    for (size_t i = 0; i <= 8; ++i) {
         if (!context->GetRequiredInputShape(i) || !context->GetRequiredInputDesc(i))
             return ge::GRAPH_FAILED;
     }
@@ -32,14 +31,11 @@ static ge::graphStatus TilingScatter(gert::TilingContext* context)
     if (!CacheShape(hbm, bf16 ? 512 : 656) || !CacheShape(dram, bf16 ? 512 : 656))
         return ge::GRAPH_FAILED;
     for (size_t i : {2U, 3U}) {
-        const auto* shape = context->GetOptionalInputShape(i);
-        const auto* desc = context->GetOptionalInputDesc(i);
-        if (bf16) {
-            if (!shape || !desc || desc->GetDataType() != ge::DT_BF16 ||
-                !CacheShape(shape->GetStorageShape(), 64) ||
-                shape->GetStorageShape().GetDim(0) != (i == 2 ? hbm : dram).GetDim(0))
-                return ge::GRAPH_FAILED;
-        } else if (shape || desc) return ge::GRAPH_FAILED;
+        const auto& shape = context->GetRequiredInputShape(i)->GetStorageShape();
+        // C8 uses KV aliases as unused KPE placeholders; BF16 uses real KPE caches.
+        if (context->GetRequiredInputDesc(i)->GetDataType() != dtype ||
+            !CacheShape(shape, bf16 ? 64 : 656) ||
+            shape.GetDim(0) != (i == 2 ? hbm : dram).GetDim(0)) return ge::GRAPH_FAILED;
     }
     for (size_t i = 4; i <= 8; ++i)
         if (context->GetRequiredInputDesc(i)->GetDataType() != ge::DT_INT32)
@@ -84,12 +80,12 @@ IMPL_OP_OPTILING(KvcacheScatterCopy).Tiling(TilingScatter).TilingParse<ScatterCo
 namespace ops {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    if (!context || !context->GetRequiredInputShape(0) || !context->GetOutputShape(0))
-        return ge::GRAPH_FAILED;
-    *context->GetOutputShape(0) = *context->GetRequiredInputShape(0);
-    if (const auto* rope = context->GetOptionalInputShape(2)) {
-        if (!context->GetOutputShape(1)) return ge::GRAPH_FAILED;
-        *context->GetOutputShape(1) = *rope;
+    if (!context) return ge::GRAPH_FAILED;
+    for (size_t output = 0; output < 2; ++output) {
+        const auto* input = context->GetRequiredInputShape(output * 2);
+        auto* shape = context->GetOutputShape(output);
+        if (!input || !shape) return ge::GRAPH_FAILED;
+        *shape = *input;
     }
     return ge::GRAPH_SUCCESS;
 }
@@ -99,7 +95,7 @@ static ge::graphStatus InferDtype(gert::InferDataTypeContext* context)
     if (!context) return ge::GRAPH_FAILED;
     const auto dtype = context->GetInputDataType(0);
     context->SetOutputDataType(0, dtype);
-    if (dtype == ge::DT_BF16) context->SetOutputDataType(1, ge::DT_BF16);
+    context->SetOutputDataType(1, dtype);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -109,21 +105,19 @@ class KvcacheScatterCopy : public OpDef {
 public:
     explicit KvcacheScatterCopy(const char* name) : OpDef(name)
     {
-        for (const char* input : {"hbm_kv", "dram_kv"})
+        // Required references avoid CANN's duplicate optional-inout ACLNN parameters.
+        // The public Torch API still accepts None for C8 KPE; its adapter supplies KV aliases.
+        for (const char* input : {"hbm_kv", "dram_kv", "hbm_kpe", "dram_kpe"})
             this->Input(input).ParamType(REQUIRED)
                 .DataType({ge::DT_BF16, ge::DT_INT8}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
-        for (const char* input : {"hbm_kpe", "dram_kpe"})
-            this->Input(input).ParamType(OPTIONAL)
-                .DataType({ge::DT_BF16, ge::DT_BF16}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
         for (const char* input : {"hbm_block_table", "dram_block_table", "source_token_ids",
                                  "destination_slots", "copy_counts"})
             this->Input(input).ParamType(REQUIRED)
                 .DataType({ge::DT_INT32, ge::DT_INT32}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
         // Matching input/output names generate a caller-owned ACLNN reference ABI.
-        this->Output("hbm_kv").ParamType(REQUIRED)
-            .DataType({ge::DT_BF16, ge::DT_INT8}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
-        this->Output("hbm_kpe").ParamType(OPTIONAL)
-            .DataType({ge::DT_BF16, ge::DT_BF16}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        for (const char* output : {"hbm_kv", "hbm_kpe"})
+            this->Output(output).ParamType(REQUIRED)
+                .DataType({ge::DT_BF16, ge::DT_INT8}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
         this->AICore().AddConfig(SCATTER_SOC);
     }
 };

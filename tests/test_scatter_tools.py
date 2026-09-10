@@ -1,7 +1,9 @@
 """CPU checks for the CLI/report, process failures, generated ABI and kernel logic."""
 import contextlib
+import copy
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -13,7 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from _common import ROOT, Workload, cases, parse_args, print_table, summarize
-from check_build import check_abi
+from check_build import check_abi, check_definition
 from run_scatter_copy_multiprocess import main, run_workers
 
 spec = importlib.util.spec_from_file_location("scatter_soc", ROOT / "torch_extension/kvcache_ops/_soc.py")
@@ -166,14 +168,38 @@ class BuildTests(unittest.TestCase):
             soc.normalize_soc("ascend910b")
 
     def test_reference_abi_and_order(self):
-        names = ["hbmKvRef", "dramKv", "hbmKpeRefOptional", "dramKpeOptional", "hbmBlockTable",
+        names = ["hbmKvRef", "dramKv", "hbmKpeRef", "dramKpe", "hbmBlockTable",
                  "dramBlockTable", "sourceTokenIds", "destinationSlots", "copyCounts"]
         signature = "aclnnKvcacheScatterCopyGetWorkspaceSize(" + ",".join("aclTensor *" + name for name in names) + ", uint64_t *size, aclOpExecutor **executor);"
         check_abi(signature)
         with self.assertRaises(RuntimeError):
             check_abi(signature.replace("uint64_t *size", "aclTensor *hbmKvOut, uint64_t *size"))
         with self.assertRaises(RuntimeError):
-            check_abi(signature.replace("hbmKpeRefOptional", "copyCounts2"))
+            check_abi(signature.replace("hbmKpeRef", "copyCounts2"))
+        with self.assertRaises(RuntimeError):
+            check_abi(signature.replace("hbmKpeRef", "hbmKpeRefOptional"))
+        # Regression for the reported CANN header: an optional inout appears twice.
+        duplicate = signature.replace("hbmKpeRef", "hbmKpeRefOptional").replace(
+            "uint64_t *size", "const aclTensor *hbmKpeRefOptional, uint64_t *size")
+        with self.assertRaises(RuntimeError):
+            check_abi(duplicate)
+
+    def test_reject_unsupported_reference_definitions(self):
+        operators = json.loads((ROOT / "csrc/ops.json").read_text())
+        check_definition(operators)
+        for field, index in (("input_desc", 2), ("output_desc", 1)):
+            invalid = copy.deepcopy(operators)
+            invalid[0][field][index]["param_type"] = "optional"
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "must be required"):
+                check_definition(invalid)
+        invalid = copy.deepcopy(operators)
+        invalid[0]["output_desc"][1]["name"] = "separate_output"
+        with self.assertRaisesRegex(RuntimeError, "caller-owned"):
+            check_definition(invalid)
+        invalid = copy.deepcopy(operators)
+        invalid[0]["output_desc"][1]["type"] = ["bfloat16", "bfloat16"]
+        with self.assertRaisesRegex(RuntimeError, "must match"):
+            check_definition(invalid)
 
     @unittest.skipUnless(shutil.which("g++"), "g++ is required for the CPU kernel model")
     def test_actual_kernel_with_cpu_memory_and_queue_model(self):

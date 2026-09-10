@@ -44,8 +44,9 @@ void Check(bool bf16, uint32_t cap, uint32_t cores, std::vector<int32_t> counts,
     const auto countsBefore = counts, srcBefore = src, dstBefore = dst;
     const auto hbmBefore = hbmTable, dramBefore = dramTable;
     auto* hbm = Register(target); auto* dram = Register(source);
-    auto* hbmKpe = bf16 ? Register(targetRope) : nullptr;
-    auto* dramKpe = bf16 ? Register(sourceRope) : nullptr;
+    // Match the ACLNN adapter: C8 supplies KV aliases in the unused KPE slots.
+    auto* hbmKpe = bf16 ? Register(targetRope) : hbm;
+    auto* dramKpe = bf16 ? Register(sourceRope) : dram;
     auto* hb = Register(hbmTable); auto* db = Register(dramTable);
     auto* s = Register(src); auto* d = Register(dst); auto* c = Register(counts);
     KvcacheScatterCopyTilingData t{std::min(cores, batch * cap), batch, cap, blocks, blocks, targetBlocks, sourceBlocks, 0, uint64_t(batch) * cap};

@@ -7,6 +7,7 @@ SOC="$("${PYTHON}" "${ROOT}/torch_extension/kvcache_ops/_soc.py")"
 BUILD="${ROOT}/build/${SOC}"
 GENERATED="${BUILD}/custom_op"
 OPP="${BUILD}/opp"
+"${PYTHON}" "${ROOT}/tests/check_build.py" --definition "${ROOT}/csrc/ops.json"
 command -v msopgen >/dev/null || { echo "Source the CANN development environment first." >&2; exit 2; }
 echo "Building KvcacheScatterCopy (BF16 + C8), target=${SOC}, jobs=${JOBS}"
 mkdir -p "${BUILD}"

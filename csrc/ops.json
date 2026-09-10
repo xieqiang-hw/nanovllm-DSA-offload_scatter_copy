@@ -29,26 +29,26 @@
       },
       {
         "name": "hbm_kpe",
-        "param_type": "optional",
+        "param_type": "required",
         "format": [
           "ND",
           "ND"
         ],
         "type": [
           "bfloat16",
-          "bfloat16"
+          "int8"
         ]
       },
       {
         "name": "dram_kpe",
-        "param_type": "optional",
+        "param_type": "required",
         "format": [
           "ND",
           "ND"
         ],
         "type": [
           "bfloat16",
-          "bfloat16"
+          "int8"
         ]
       },
       {
@@ -127,14 +127,14 @@
       },
       {
         "name": "hbm_kpe",
-        "param_type": "optional",
+        "param_type": "required",
         "format": [
           "ND",
           "ND"
         ],
         "type": [
           "bfloat16",
-          "bfloat16"
+          "int8"
         ]
       }
     ],

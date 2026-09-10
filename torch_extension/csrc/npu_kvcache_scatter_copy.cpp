@@ -60,8 +60,12 @@ void Scatter(
     TORCH_CHECK(hbm.device().is_privateuseone(), "kvcache_scatter_copy requires NPU tensors.");
     const c10_npu::NPUGuard deviceGuard(hbm.device());
     const auto keepalive = std::make_tuple(hbm, dram, hbmKpe, dramKpe, hbmTable, dramTable, src, dst, counts);
+    // CANN cannot generate optional inout references reliably. C8 reuses existing
+    // KV tensors for the required KPE slots; its kernel never accesses these slots.
+    const auto& apiHbmKpe = hbmKpe.has_value() ? *hbmKpe : hbm;
+    const auto& apiDramKpe = dramKpe.has_value() ? *dramKpe : dram;
     EXEC_NPU_CMD_ORDERED(aclnnKvcacheScatterCopy, keepalive,
-                        hbm, dram, hbmKpe, dramKpe, hbmTable, dramTable, src, dst, counts);
+                        hbm, dram, apiHbmKpe, apiDramKpe, hbmTable, dramTable, src, dst, counts);
 }
 } // namespace
 
