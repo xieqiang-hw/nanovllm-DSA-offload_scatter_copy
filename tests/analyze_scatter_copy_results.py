@@ -1,127 +1,59 @@
 #!/usr/bin/env python3
-
-"""Summarize A3 multiprocess Scatter Copy timing results."""
+"""Render scatter results using exactly the shared six columns (stdlib only)."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
-import os
-from datetime import datetime, timezone
 from pathlib import Path
 
-import pandas as pd
+from scatter_config import RESULTS_SUBDIR
+from scatter_results import COLUMNS, build_rows, format_table, formatted_row
 
 
-def parse_args() -> argparse.Namespace:
-    repo_root = Path(__file__).resolve().parent.parent
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--results-dir",
-        type=Path,
-        default=repo_root / "results" / "multiprocess",
-        help="Directory produced by run_scatter_copy_multiprocess.sh.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        help="Output CSV path (default: RESULTS_DIR/scatter_copy_timing_summary.csv).",
-    )
-    return parser.parse_args()
-
-
-def normalize_case(case: dict[str, object]) -> dict[str, object]:
-    per_device = case["per_device"]
-    if not per_device:
-        raise ValueError("A multiprocess case contains no per-device results.")
-    config = per_device[0]["config"]
-    summary = case["summary"]
-    return {
-        "cards": case["device_count"],
-        "batch_size": config["batch_size"],
-        "copy_count": config["copy_max"],
-        "avg_us_min": summary["avg_us_min"],
-        "avg_us_mean": summary["avg_us_mean"],
-        "avg_us_max": summary["avg_us_max"],
-        "payload_gbps_sum": summary["payload_gbps_sum"],
-        "payload_gbps_sum_by_avg_us_max": summary[
-            "payload_gbps_sum_by_avg_us_max"
-        ],
-    }
-
-
-def load_cases(results_dir: Path) -> list[dict[str, object]]:
-    case_paths = sorted(results_dir.glob("cards*_bs*_copy*.json"))
-    if not case_paths:
+def load_cases(results_dir: Path) -> tuple[list[Path], list[dict]]:
+    manifest = results_dir / "scatter_copy_run_manifest.json"
+    if manifest.exists():
+        run = json.loads(manifest.read_text(encoding="utf-8"))
+        if run.get("status") != "passed":
+            raise ValueError("The latest sweep did not complete successfully; inspect its logs.")
+        paths = [(results_dir / name).resolve() for name in run["case_files"]]
+        if any(path.parent != results_dir.resolve() for path in paths):
+            raise ValueError("Run manifest contains a path outside its results directory.")
+    else:
+        # Historical A3, A5 BF16 and C8 names are all accepted.
+        paths = sorted(results_dir.glob("cards*.json"))
+    if not paths:
         raise FileNotFoundError(f"No case JSON files found in {results_dir}")
-    return [
-        json.loads(path.read_text(encoding="utf-8")) for path in case_paths
-    ]
+    return paths, [json.loads(path.read_text(encoding="utf-8")) for path in paths]
 
 
-def write_summary(
-    results_dir: Path, cases: list[dict[str, object]]
-) -> Path:
-    summary_path = results_dir / "scatter_copy_multiprocess_summary.json"
-    summary = {
-        "schema_version": 1,
-        "test": "kvcache_scatter_copy_multiprocess_sweep",
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "case_count": len(cases),
-        "cases": cases,
-    }
-    temporary = summary_path.with_name(
-        f".{summary_path.name}.{os.getpid()}.tmp"
-    )
-    temporary.write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(summary_path)
-    return summary_path
-
-
-def build_timing(cases: list[dict[str, object]]) -> pd.DataFrame:
-    rows = [normalize_case(case) for case in cases]
-    if not rows:
-        raise ValueError("No cases available for analysis.")
-    timing = pd.DataFrame(rows).sort_values(["cards", "batch_size", "copy_count"])
-    timing = timing.reset_index(drop=True)
-    for column in timing.select_dtypes(include="number").columns:
-        if column not in {"cards", "batch_size", "copy_count"}:
-            timing[column] = timing[column].round(3)
-    return timing
-
-
-def print_tables(timing: pd.DataFrame) -> None:
-    print("\n===== A3 MULTIPROCESS ALL RESULTS =====")
-    print(timing.to_string(index=False))
-    table = timing.pivot_table(
-        index=["cards", "batch_size"],
-        columns="copy_count",
-        values=["avg_us_mean", "avg_us_max", "payload_gbps_sum_by_avg_us_max"],
-        aggfunc="first",
-    ).sort_index(axis=1, level=[0, 1])
-    print("\n===== A3 MULTIPROCESS PIVOT =====")
-    print(table.to_string())
+def analyze(results_dir: Path, output: Path | None = None) -> list[dict]:
+    paths, cases = load_cases(results_dir)
+    rows = build_rows(cases)
+    output = output or results_dir / "scatter_copy_timing_summary.csv"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=COLUMNS)
+        writer.writeheader()
+        writer.writerows(formatted_row(row) for row in rows)
+    output.with_suffix(".md").write_text(format_table(rows, markdown=True), encoding="utf-8")
+    (results_dir / "scatter_copy_multiprocess_summary.json").write_text(json.dumps({
+        "schema_version": 2, "columns": COLUMNS, "case_count": len(rows),
+        "case_files": [str(path.name) for path in paths], "rows": rows,
+    }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(format_table(rows), end="")
+    print(f"Saved: {output}")
+    return rows
 
 
 def main() -> None:
-    args = parse_args()
-    results_dir = args.results_dir.resolve()
-    output = (
-        args.output.resolve()
-        if args.output is not None
-        else results_dir / "scatter_copy_timing_summary.csv"
-    )
-    cases = load_cases(results_dir)
-    summary_path = write_summary(results_dir, cases)
-    print(f"Wrote {len(cases)} cases to {summary_path}")
-    timing = build_timing(cases)
-    print_tables(timing)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    timing.to_csv(output, index=False)
-    print(f"\nSaved: {output}")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--results-dir", type=Path, default=Path(__file__).resolve().parents[1] / RESULTS_SUBDIR)
+    parser.add_argument("--output", type=Path, help="CSV path; a six-column Markdown file is also written alongside it.")
+    args = parser.parse_args()
+    analyze(args.results_dir.resolve(), args.output)
 
 
 if __name__ == "__main__":

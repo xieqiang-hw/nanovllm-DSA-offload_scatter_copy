@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scatter_cli import add_copy_count_arg, resolve_copy_count
+from scatter_results import print_result, single_result
+
 # Torch/CANN imports are deliberately deferred to main(): NUMA/CPU policies must
 # be applied before either library creates background threads or host buffers.
 from numa_support import (
@@ -53,13 +56,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--batch-size", type=int, default=24)
-    parser.add_argument("--source-len", type=int, default=20000)
-    parser.add_argument("--hbm-slots", type=int, default=6144)
+    parser.add_argument("--source-len", type=int, default=65536)
+    parser.add_argument("--hbm-slots", type=int, default=8192)
+    add_copy_count_arg(parser)
     parser.add_argument("--copy-min", type=int, default=0)
     parser.add_argument("--copy-max", type=int, default=300)
     parser.add_argument("--copy-cap", type=int, default=2048)
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--timing", choices=("eager", "graph"), default="eager")
     parser.add_argument("--memory-policy", choices=("inherit", "default", "bind", "interleave"), default="inherit")
@@ -79,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timing-start-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--timing-done-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--timing-stop-file", type=Path, help=argparse.SUPPRESS)
-    return parser.parse_args()
+    return resolve_copy_count(parser.parse_args())
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -541,21 +545,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         assert_copied(case, source_rows, destination_rows)
     else:
         assert_all_hbm_poisoned(case)
-    payload_gbps = (
-        payload_bytes / (avg_us * 1000)
-        if payload_bytes and avg_us
-        else 0.0
-    )
-    print(
-        "A3_SCATTER_RESULT "
-        f"copy_min={args.copy_min} copy_max={args.copy_max} "
-        f"copy_cap={args.copy_cap} copied_tokens={copied_tokens} "
-        f"avg_us={avg_us:.3f} payload_gbps={payload_gbps:.3f} "
-        f"timer=npu_event timing={args.timing} warmup={args.warmup} iters={args.iters}",
-        flush=True,
-    )
+    print_result(single_result(args, payload_bytes, avg_us))
     result: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "test": "kvcache_scatter_copy",
         "status": "passed",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -591,10 +583,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "output_alias": True,
             "guard_unchanged": True,
         },
+        "summary": single_result(args, payload_bytes, avg_us),
         "performance": {
             "timer": "npu_event",
             "avg_us": avg_us,
-            "payload_gbps": payload_gbps,
             "host_start_ns": host_start_ns,
             "host_end_ns": host_end_ns,
         },

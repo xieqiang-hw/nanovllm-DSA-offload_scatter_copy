@@ -23,6 +23,7 @@ from pathlib import Path
 
 from numa_support import parse_ids, topology, worker_plans
 from test_scatter_copy_multiprocess import parse_devices
+from scatter_results import COLUMNS, formatted_row, normalize_case, print_result
 
 
 def parse_args():
@@ -194,31 +195,30 @@ def main():
             summary = result["summary"]
             row = {"case": label, "round": repeat + 1, "devices": ",".join(map(str, subset)),
                    "policy": policy, "node": node if policy == "concentrated" else "",
-                   "rank_mean_us": summary["avg_us_mean"], "rank_max_us": summary["avg_us_max"],
-                   "aggregate_gbps": summary["payload_gbps_sum_by_avg_us_max"],
-                   "host_window_gbps": summary["host_window_payload_gbps"],
+                   **normalize_case(result),
                    "host_start_skew_us": summary["host_start_skew_us"],
                    "host_interval_overlap_fraction": summary["host_interval_overlap_fraction"],
                    "placement_verified": summary["all_placements_sample_verified"]}
             rows.append(row)
-            print("SCATTER_NUMA_RESULT " + json.dumps(row), flush=True)
+            print(f"SCATTER_NUMA_RESULT case={label} round={repeat + 1}", flush=True)
+            print_result(row)
             print("SCATTER_NUMA_NODE_LOAD " + json.dumps(placement_load(result)), flush=True)
             # Checkpoint after each trial, keeping results if a later one fails.
             with (root / "trials.csv").open("w", newline="", encoding="utf-8") as file:
-                writer = csv.DictWriter(file, fieldnames=list(row))
+                writer = csv.DictWriter(file, fieldnames=COLUMNS)
                 writer.writeheader()
-                writer.writerows(rows)
+                writer.writerows(formatted_row(item) for item in rows)
+            # Trial identity and placement diagnostics remain available without
+            # adding columns or another bandwidth definition to the CSV.
+            (root / "trials.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
     aggregate = []
-    print("SCATTER_NUMA_SUMMARY (median across rounds; rank_max_us is the slowest worker)")
     for label, _, _, _ in cases:
         samples = [row for row in rows if row["case"] == label]
-        worst = [row["rank_max_us"] for row in samples]
+        worst = [row["avg_us_max"] for row in samples]
         item = {"case": label, "rank_max_us_median": statistics.median(worst),
                 "rank_max_us_min": min(worst), "rank_max_us_max": max(worst),
-                "aggregate_gbps_median": statistics.median(row["aggregate_gbps"] for row in samples),
                 "placement_verified_all_rounds": all(row["placement_verified"] for row in samples)}
         aggregate.append(item)
-        print(json.dumps(item), flush=True)
     (root / "summary.json").write_text(json.dumps({"config": {k: str(v) if isinstance(v, Path) else v
                                      for k, v in vars(args).items()}, "topology": topo,
                                      "summary": aggregate, "trials": rows}, indent=2), encoding="utf-8")

@@ -47,66 +47,115 @@ export OPS_OVERLAP_INSTALL_OPP_PATH=$PWD/_custom_opp
 export PYTHONPATH=$PWD/torch_extension:$PYTHONPATH
 ```
 
-## 单卡测试
+## 统一带宽测试
+
+三个分支使用相同的入口、参数和六列结果。本分支测试 **A3 BF16**；每个有效 token 为 **1152 字节**，默认 `COPY_CAP=2048`。BF16 需要 HBM slots 大于实际 copy count，以保留 guard token。
+
+在仓库根目录、已安装本分支编译产物的 CANN/PyTorch 环境中运行：
 
 ```bash
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ASCEND_LAUNCH_BLOCKING=0
-export ASCEND_RT_VISIBLE_DEVICES=0
-export PYTHONUNBUFFERED=1
+TEST_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+CARD_COUNTS="1 2 4 8" \
+BATCH_SIZES="8 16 24 32" \
+COPY_COUNTS="0 100 200 300 500 2048" \
+  bash tests/run_scatter_copy_multiprocess.sh
+```
+
+只跑一组时，三个分支的命令完全相同：
+
+```bash
+bash tests/run_scatter_copy_multiprocess.sh \
+  --cards 8 --batch-size 8 --copy-count 300
+```
+
+参数也支持多个值，例如 `--cards 1 2 4 --batch-size 8 24 --copy-count 200 300`。命令行参数优先于环境变量。`--dry-run`（或 `DRY_RUN=1`）只检查参数并打印每组命令，不加载 CANN/Torch、不启动 NPU，也不写结果文件：
+
+```bash
+bash tests/run_scatter_copy_multiprocess.sh \
+  --visible-devices 2,3,6,7 --cards 1 2 4 \
+  --batch-size 8 16 --copy-count 0 200 300 --dry-run
+```
+
+参数约定：
+
+- `cards` / `CARD_COUNTS` 统计当前可见列表中的**逻辑 NPU/die 数**。每组使用前 N 个可见设备；每个 die 启动独立进程。在 A3 的 8 张物理卡、16 die 机器上，全机测试要设置可见列表 `0,1,...,15`（实际命令中展开全部编号）和 `CARD_COUNTS="1 2 4 8 16"`。
+- `TEST_VISIBLE_DEVICES` 指定可见设备，`--visible-devices` 可覆盖。兼容本分支旧的 `A3_TEST_VISIBLE_DEVICES` 或 `A5_TEST_VISIBLE_DEVICES`；优先级为统一变量、旧变量、已有 `ASCEND_RT_VISIBLE_DEVICES`、分支默认值。
+- `batch_size` 是**每 die** 的请求数；`copy_count` 是**每个请求**的固定搬移 token 数。每 die 每轮有效 payload = `batch_size × copy_count × bytes_per_token`。
+- 默认卡数为可见数量内的 `1 2 4 8 16`；A3 默认可见 16 个 die，A5 默认 8 个。显式指定时支持任意正数卡数，不局限于这些档位。
+- 三个分支默认 `BATCH_SIZES="8 16 24 32"`、`COPY_COUNTS="0 100 200 300 500 2048"`、`SOURCE_LEN=65536`、`HBM_SLOTS=8192`、`WARMUP=10`、`ITERS=1000`、`SEED=7`。`COPY_CAP` 是 metadata 容量，不是实际 copy 数。
+- 其余统一参数：`--source-len`、`--hbm-slots`、`--copy-cap`、`--warmup`、`--iters`、`--seed`、`--results-dir`；同名大写下划线环境变量也可使用，输出目录环境变量为 `RESULTS_DIR`。Python 路径可用 `PYTHON_BIN` 指定。
+- 统一扫参固定使用本分支 dtype，防止去掉 dtype 列后混合不同格式。若设置旧 `DTYPES`，只能填本分支的单个 dtype。
+- 空列表、重复值、负数、超出可见数量的卡数、超出 source/HBM/copy-cap 的 copy 数，在启动 worker 前报错。
+
+## 单组与单 die 入口
+
+也可直接调用 Python launcher，`--cards N` 与 `--devices` 二选一；后者是可见列表内重编号后的逻辑索引。所有参数在三个分支上使用相同名称；省略 `--output` 时，按 cards/BS/copy 自动命名并写入本分支默认结果目录：
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export PYTHONPATH="$PWD/torch_extension${PYTHONPATH:+:$PYTHONPATH}"
+python3 tests/test_scatter_copy_multiprocess.py \
+  --cards 4 --batch-size 24 --copy-count 300 \
+  --source-len 65536 --hbm-slots 8192 \
+  --warmup 10 --iters 1000 --same-seed --seed 7 \
+  --output results/manual/cards4_bs24_copy300.json
 
 python3 tests/test_scatter_copy.py \
-  --device npu:0 --batch-size 24 \
-  --source-len 65536 --hbm-slots 8192 \
-  --copy-cap 2048 --copy-min 0 --copy-max 300 \
-  --warmup 10 --iters 100 --seed 7
+  --device npu:0 --batch-size 24 --copy-count 300 \
+  --source-len 65536 --hbm-slots 8192 --warmup 10 --iters 1000
 ```
 
-测试使用 `torch_npu.empty_with_swapped_memory` 创建真实 DRAM source，验证 DRAM→HBM 数据精确一致、输出 alias 和未命中 guard token，并使用 NPU Event 测量时延。测试全零 copy count 时设置 `--copy-min 0 --copy-max 0`。
+`--copy-count` 同时设置 `--copy-min/--copy-max`。旧的随机范围参数仍可用于正确性测试；分析这种旧结果时 `copy_count` 显示为 `min..max`，不会把上限冒充固定 copy 数。
 
-## 多卡测试
+BF16 继续验证真实 swapped-memory DRAM→HBM 数据精确一致、输出 alias 和未命中的 guard token。
 
-```bash
-bash tests/run_scatter_copy_multiprocess.sh
+## 六列结果与带宽口径
+
+终端结果表、CSV 和 Markdown 均只输出以下六列，顺序固定，时间/带宽保留三位小数：
+
+```text
+cards  batch_size  copy_count  avg_us_mean  avg_us_max  avg_bandwidth
 ```
 
-该批量脚本当前按 A3 测试机配置使用 `/usr/local/Ascend/cann-9.0.1` 和 `SOC_VERSION=ascend910_9391`；在其他安装路径运行时，应先相应调整脚本中的 CANN 路径。
+对每个 die，先用 NPU Event 包围 `iters` 次 Scatter，将计时时间除以 `iters`，得到 `t_i`（μs）。`D_i` 是该 die **每轮实际有效搬移字节数**。定义：
 
-多卡调度逻辑：
+```text
+avg_us_mean  = mean(t_i)
+avg_us_max   = max(t_i)
+avg_bandwidth = sum(D_i / (t_i * 1000))   # GB/s，先逐 die 计算再求和
+```
 
-1. 每张 NPU 通过 `subprocess.Popen` 启动独立单卡 worker。
-2. 所有 worker 完成数据构造和正确性检查后，通过 ready/start 文件同时开始 warmup。
-3. 所有 worker 完成 warmup 后再次同步，同时开始 NPU Event 计时。
-4. 父进程检查每个 worker 的返回码，读取单卡 JSON 并聚合结果。
+`avg_bandwidth` 虽含 avg，含义是基于各 die 平均耗时计算的**带宽之和**，不再除以 cards。只计算一次有效 payload，不把源读取与目标写入重复计数，不使用整块分配容量。BF16 的 `D_i = copied_tokens_i × 1152`；C8 的 `D_i = copied_tokens_i × 656`（512B FP8 latent + 128B RoPE + 16B scale）。零 copy 的带宽为 0。
 
-批量脚本默认：
+`avg_us_max` 是各 die 平均耗时的最大值，不是某次调用的最大耗时。固定 metadata 会重复搬运；初始化、正确性校验及 warmup 不在计时区间。该带宽是此并发测试的有效吞吐估计，结果不代表总线硬件计数器读数。
 
-- 卡数：`1/2/4/8/16`
-- batch size：`8/24`
-- copy count：`0/100/200/300/500/2048`
-- `source_len=65536`
-- `hbm_slots=8192`
-- `copy_cap=2048`
-- `warmup=10`
-- `iters=1000`
-- `seed=7`，所有卡使用相同 workload
+默认输出目录为 `results/scatter_copy_a3`，各分支分开保存，防止切换分支后混入其他格式。每组生成 JSON 和日志，并生成统一命名的汇总文件：
 
-结果写入 `results/multiprocess`，每个 case 生成 JSON 和日志。全部 case 完成后自动运行分析脚本。
+- `scatter_copy_timing_summary.csv`：六列数据。
+- `scatter_copy_timing_summary.md`：相同六列 Markdown 表。
+- `scatter_copy_multiprocess_summary.json`：同口径、未舍入的结果行。
+- `scatter_copy_run_manifest.json`：本轮 case 清单及完成状态。每次扫参只汇总本轮选择的 case；失败的重跑不会继续使用上次成功结果。
 
-## 结果分析
+逐 case JSON 继续保存配置、每 die 耗时、有效字节数和正确性诊断，便于复核；不再输出其他定义的带宽。worker 的完整日志保存在对应 `.log`，失败时终端显示日志末尾。
+
+重新分析已有结果（无需 NPU，全部只依赖 Python 标准库）：
 
 ```bash
 python3 tests/analyze_scatter_copy_results.py \
-  --results-dir results/multiprocess
+  --results-dir results/scatter_copy_a3
+python3 tests/format_scatter_copy_csv.py \
+  --input results/scatter_copy_a3/scatter_copy_timing_summary.csv
 ```
 
-分析依赖 `pandas`，输出：
+旧 JSON 可使用 `--results-dir` 指向原目录；分析器从 `per_device` 的字节数和时间重新计算。没有本轮清单的旧目录会读取所有 `cards*.json`；若同一组 cards/BS/copy 出现多份结果，会报错并要求分开分析，避免静默合并不同配置。旧 CSV 需要先从原始 JSON 重新生成。A5 的旧 `run/test/analyze/format_kvcache_scatter_copy*` 入口仍可使用。
 
-- `scatter_copy_multiprocess_summary.json`
-- `scatter_copy_timing_summary.csv`
-- 控制台完整结果表和 pivot 表
+CPU 上的工具回归检查：
 
-`payload_gbps_sum` 是各卡独立带宽之和；`payload_gbps_sum_by_avg_us_max` 使用所有卡每轮 payload 总量除以最慢卡的平均时延，表示同步场景下的保守聚合吞吐。
+```bash
+python3 tests/test_scatter_tools.py -v
+```
+
+该检查覆盖参数传递、非连续可见设备、逐 die 带宽求和、零 copy、有效字节数校验、六列表格、旧 JSON 读取和旧结果隔离；它不替代目标 A3/A5 上的算子正确性与带宽实测。
 
 ## NUMA 亲和性与负载均衡实验
 
@@ -181,7 +230,7 @@ python3 tests/benchmark_scatter_copy_numa.py \
 
 ### 看哪些结果
 
-结果默认保存到 `results/numa/<时间>_<PID>/`（或 `--output-dir`）：`summary.json`、`trials.csv`、每轮完整结果和各 worker 日志、测试前后硬件信息。旧的 `analyze_scatter_copy_results.py` 继续用于原多卡扫参结果，不把不同 NUMA 策略混成一组。
+结果默认保存到 `results/numa/<时间>_<PID>/`（或 `--output-dir`）：`summary.json`、六列 `trials.csv`、包含策略/轮次/页位置诊断的 `trials.json`、每轮完整结果和各 worker 日志、测试前后硬件信息。统一的 `analyze_scatter_copy_results.py` 用于普通多卡扫参结果，不把不同 NUMA 策略混成一组。
 
 优先比较：实际页分布是否改变；各轮 `rank_max_us`（最慢 die）、`rank_mean_us`、按最慢 die 计的聚合带宽；各 die 时延是否均衡；`host_start_skew_us` 是否远小于整个计时窗口。Host interval overlap 只描述计时区间，不是硬件链路利用率；快 worker 计时结束后仍保持 copy 负载。Host window 带宽是包含提交/同步开销的辅助量，不是物理 DRAM 总线带宽。
 

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -14,27 +13,27 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scatter_cli import add_copy_count_arg, add_device_args, resolve_copy_count, selected_devices, validate_workload
+from scatter_results import copy_label, print_result, summarize_devices
+
 from numa_support import POLICIES, parse_ids, topology, worker_plans
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_device_args(parser, "0")
     parser.add_argument(
-        "--devices",
-        default="0,1",
-        help="Comma-separated logical NPU indices, for example 0,1,2,3.",
-    )
-    parser.add_argument(
-        "--output", type=Path, default=Path("scatter_multiprocess.json")
+        "--output", type=Path, help="Case JSON path (default: branch results directory)."
     )
     parser.add_argument("--batch-size", type=int, default=24)
-    parser.add_argument("--source-len", type=int, default=20000)
-    parser.add_argument("--hbm-slots", type=int, default=6144)
+    parser.add_argument("--source-len", type=int, default=65536)
+    parser.add_argument("--hbm-slots", type=int, default=8192)
+    add_copy_count_arg(parser)
     parser.add_argument("--copy-min", type=int, default=0)
     parser.add_argument("--copy-max", type=int, default=300)
     parser.add_argument("--copy-cap", type=int, default=2048)
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--timing", choices=("eager", "graph"), default="eager")
     parser.add_argument("--numa-policy", choices=POLICIES, default="inherit")
@@ -52,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use exactly the same random workload on every card.",
     )
-    return parser.parse_args()
+    return resolve_copy_count(parser.parse_args())
 
 
 def parse_devices(value: str) -> list[int]:
@@ -99,7 +98,8 @@ def stop_workers(processes):
 
 def main() -> None:
     args = parse_args()
-    devices = parse_devices(args.devices)
+    validate_workload(args)
+    devices = selected_devices(args)
     if args.numa_node_map is not None and args.numa_policy != "mapped":
         raise ValueError("--numa-node-map requires --numa-policy=mapped.")
     if args.numa_page_samples < 1:
@@ -214,25 +214,14 @@ def main() -> None:
             result["logical_device_index"] = device
             per_device.append(result)
 
-    latencies = [item["performance"]["avg_us"] for item in per_device]
-    bandwidths = [item["performance"]["payload_gbps"] for item in per_device]
     copied_tokens = [item["workload"]["copied_tokens"] for item in per_device]
-    payload_bytes = [
-        item["workload"]["payload_bytes_per_iteration"] for item in per_device
-    ]
-    avg_us_max = max(latencies)
     host_starts = [item["performance"]["host_start_ns"] for item in per_device]
     host_ends = [item["performance"]["host_end_ns"] for item in per_device]
     host_span_ns = max(host_ends) - min(host_starts)
     host_common_ns = max(0, min(host_ends) - max(host_starts))
     placement = [(item.get("numa") or {}).get("placement_status", "not_requested") for item in per_device]
-    payload_gbps_sum_by_avg_us_max = (
-        sum(payload_bytes) / (avg_us_max * 1000)
-        if sum(payload_bytes) and avg_us_max
-        else 0.0
-    )
     output = {
-        "schema_version": 1,
+        "schema_version": 2,
         "test": "kvcache_scatter_copy_multiprocess",
         "status": "passed",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -245,11 +234,7 @@ def main() -> None:
         "worker_plans": plans,
         "topology": topo,
         "summary": {
-            "avg_us_min": min(latencies),
-            "avg_us_mean": statistics.fmean(latencies),
-            "avg_us_max": avg_us_max,
-            "payload_gbps_sum": sum(bandwidths),
-            "payload_gbps_sum_by_avg_us_max": payload_gbps_sum_by_avg_us_max,
+            **summarize_devices(per_device),
             "copied_tokens_sum_per_iteration": sum(copied_tokens),
             "all_correct": True,
             "placement_statuses": placement,
@@ -257,7 +242,6 @@ def main() -> None:
             "host_start_skew_us": (max(host_starts) - min(host_starts)) / 1000,
             "host_interval_overlap_fraction": host_common_ns / host_span_ns if host_span_ns else 0.0,
             "hold_load_until_all_timed": numa_enabled,
-            "host_window_payload_gbps": (sum(payload_bytes) * args.iters / host_span_ns) if host_span_ns else 0.0,
         },
         "per_device": per_device,
     }
@@ -267,16 +251,8 @@ def main() -> None:
         encoding="utf-8",
     )
     temporary.replace(args.output)
-    print(
-        "A3_SCATTER_MULTIPROCESS_RESULT "
-        f"cards={len(devices)} avg_us_mean={statistics.fmean(latencies):.3f} "
-        f"payload_gbps_sum={sum(bandwidths):.3f} "
-        f"payload_gbps_sum_by_avg_us_max={payload_gbps_sum_by_avg_us_max:.3f} "
-        f"avg_us_max={avg_us_max:.3f} placement={placement} "
-        f"host_start_skew_us={(max(host_starts) - min(host_starts)) / 1000:.3f} "
-        f"output={args.output}",
-        flush=True,
-    )
+    print_result({"cards": len(devices), "batch_size": args.batch_size,
+                  "copy_count": copy_label(vars(args)), **summarize_devices(per_device)})
     print("A3_KVCACHE_SCATTER_COPY_MULTIPROCESS_UT_OK", flush=True)
 
 
