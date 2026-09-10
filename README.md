@@ -1,29 +1,10 @@
 # kvcache_scatter_copy
 
-一个 caller-owned 的 DRAM→HBM scatter 算子，按输入 dtype 选择 BF16 或 packed-C8；同一份源码在本机针对 A3/A5 编译。
-
-| 平台 | BF16：512 CKV＋64 RoPE 元素，1152 B/token | packed-C8：656 B/token |
-|---|---|---|
-| A3 / Ascend 910C | 支持目标，待硬件验收 | 支持目标，待硬件验收 |
-| A5 / Ascend 950 | 支持目标，待硬件验收 | 支持目标，待硬件验收 |
-
-## 构建
-
-先加载本机匹配的 CANN 开发环境，并安装对应的 `torch`、`torch_npu`；需要 `msopgen` 和 `torch_npu.empty_with_swapped_memory`。
-
-```bash
-bash build.sh
-export PYTHONPATH="$PWD/torch_extension${PYTHONPATH:+:$PYTHONPATH}"
-```
-
-构建自动识别 SoC，一次包含 BF16/C8，产物保存在 `build/<soc>/`。显式指定目标可用 `SOC_VERSION=ascend910_93 bash build.sh` 或 `SOC_VERSION=ascend950 bash build.sh`；不同架构的机器分别编译。Python 包只加载当前仓库中匹配本机 SoC 的 OPP。`PYTHON`、`MAX_JOBS` 仅配置构建解释器和并行度。
-
 ## 接口
 
-```python
-import kvcache_ops  # 在首次 NPU 操作之前导入，注册本仓库算子
-import torch
+以下算子同时支持 A3 和 A5 ，支持 BF16 kvcache (512+64) 和 C8 (656B) 。
 
+```python
 # torch.ops.kvcache_ops.kvcache_scatter_copy 的签名
 # Optional 表示可传 None；九个参数都必须显式传入。
 def kvcache_scatter_copy(
@@ -62,6 +43,17 @@ kvcache_ops.kvcache_scatter_copy(
     hbm_block_table, dram_block_table, src_ids, dst_slots, copy_counts,
 )
 ```
+
+## 构建
+
+先加载本机匹配的 CANN 开发环境，并安装对应的 `torch`、`torch_npu`；需要 `msopgen` 和 `torch_npu.empty_with_swapped_memory`。
+
+```bash
+bash build.sh
+export PYTHONPATH="$PWD/torch_extension${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+构建自动识别 SoC，一次包含 BF16/C8，产物保存在 `build/<soc>/`。显式指定目标可用 `SOC_VERSION=ascend910_93 bash build.sh` 或 `SOC_VERSION=ascend950 bash build.sh`；不同架构的机器分别编译。Python 包只加载当前仓库中匹配本机 SoC 的 OPP。`PYTHON`、`MAX_JOBS` 仅配置构建解释器和并行度。
 
 ## 单 die 验证
 
