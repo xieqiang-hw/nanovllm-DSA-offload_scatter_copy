@@ -12,26 +12,43 @@ import torch_npu
 POISON = 65
 
 
-def swapped_from_cpu(cpu, device):
+def swapped_from_cpu(cpu, device, trace=lambda message: None):
     allocator = getattr(torch_npu, "empty_with_swapped_memory", None)
     if allocator is None:
         raise RuntimeError("torch_npu.empty_with_swapped_memory is required for real DRAM sources.")
+    trace("DRAM: empty_with_swapped_memory")
     result = allocator(cpu.shape, dtype=cpu.dtype, device=device)
-    # Initialize raw bytes: BF16 NaNs/signed zeros must not undergo arithmetic.
+    # Multiply int8 bytes by one; BF16 NaNs/signed zeros stay bit-exact.
+    trace("DRAM: byte view and fill with ones")
     raw = result.view(torch.int8)
-    raw.zero_()
+    raw.fill_(1)
+    trace("DRAM: upload initialization bytes to HBM")
     staging = cpu.view(torch.int8).to(device)
-    raw.add_(staging)
+    trace("DRAM: initialize from HBM")
+    raw.mul_(staging)
+    trace("DRAM: synchronize initialization")
     torch.npu.synchronize()
     return result
 
 
+def swapped_to_cpu_bytes(tensor):
+    # Swapped DRAM cannot use the ordinary .cpu()/memcpy path on older stacks.
+    # Use the documented mul_ path into HBM, without floating-point arithmetic.
+    raw = tensor.view(torch.int8)
+    staging = torch.empty(raw.shape, dtype=torch.int8, device=raw.device).fill_(1)
+    staging.mul_(raw)
+    return staging.cpu()
+
+
 class Case:
-    def __init__(self, config: Workload, device: str, *, counts=None, edges=False):
+    def __init__(self, config: Workload, device: str, *, counts=None, edges=False, debug=False):
         self.config, self.device = config, torch.device(device)
+        self.debug = debug
+        self.trace("set_device")
         torch.npu.set_device(self.device)
         torch.set_num_threads(1)
         torch.npu.config.allow_internal_format = False
+        self.trace("prepare CPU metadata")
         batch, cap = config.batch_size, config.copy_cap
         source_blocks = (config.source_len + 127) // 128
         target_blocks = (config.hbm_slots + 127) // 128
@@ -61,18 +78,26 @@ class Case:
             cpu = torch.randint(-128, 128, (batch * source_blocks, 128, 1, width),
                                 dtype=torch.int8, generator=payload_rng).view(dtype)
             self.sources_cpu.append(cpu)
-            self.sources.append(swapped_from_cpu(cpu, self.device))
+            self.sources.append(swapped_from_cpu(cpu, self.device, self.trace))
+            self.trace("allocate HBM destination")
             self.targets.append(torch.empty((batch * target_blocks + 1, 128, 1, width // cpu.element_size()),
                                             dtype=dtype, device=self.device))
         self.metadata_cpu = (self.hbm_table_cpu, self.dram_table_cpu, self.src_cpu, self.dst_cpu, self.counts_cpu)
+        self.trace("upload metadata")
         self.metadata = tuple(t.to(self.device) for t in self.metadata_cpu)
         self.inputs = (self.targets[0], self.sources[0],
                        self.targets[1] if config.dtype == "bf16" else None,
                        self.sources[1] if config.dtype == "bf16" else None, *self.metadata)
         self.pointers = tuple(t.data_ptr() for t in self.inputs if t is not None)
         self.expected = self.reference()
+        self.trace("synchronize fixture and empty_cache")
         torch.npu.synchronize()
         torch.npu.empty_cache()
+        self.trace("fixture ready")
+
+    def trace(self, message):
+        if self.debug:
+            print(f"DEBUG {self.device} {self.config.dtype}: {message}", flush=True)
 
     def reference(self):
         # CPU gather/scatter oracle is independent of kernel core ownership/tiling.
@@ -102,20 +127,33 @@ class Case:
     def verify(self):
         if self.pointers != tuple(t.data_ptr() for t in self.inputs if t is not None):
             raise AssertionError("A caller-owned tensor address changed.")
-        for target, expected in zip(self.targets, self.expected):
+        for index, (target, expected) in enumerate(zip(self.targets, self.expected)):
+            self.trace(f"verify HBM destination {index}")
             if not torch.equal(target.view(torch.int8).cpu().reshape_as(expected), expected):
                 raise AssertionError("Cache bytes differ, or inactive/guard bytes were modified.")
-        for tensor, cpu in zip((*self.sources, *self.metadata), (*self.sources_cpu, *self.metadata_cpu)):
+        for index, (tensor, cpu) in enumerate(zip(self.sources, self.sources_cpu)):
+            self.trace(f"verify DRAM source {index} via HBM")
+            if not torch.equal(swapped_to_cpu_bytes(tensor), cpu.view(torch.int8)):
+                raise AssertionError(f"Read-only DRAM source {index} was modified.")
+        for index, (tensor, cpu) in enumerate(zip(self.metadata, self.metadata_cpu)):
+            self.trace(f"verify metadata {index}")
             if not torch.equal(tensor.view(torch.int8).cpu(), cpu.view(torch.int8)):
-                raise AssertionError("A read-only source or metadata tensor was modified.")
+                raise AssertionError(f"Read-only metadata {index} was modified.")
 
     def check(self):
+        self.trace("reset HBM destination")
         self.reset()
+        if self.debug:
+            torch.npu.synchronize()  # Separate initialization failures from scatter failures.
+        self.trace("call kvcache_scatter_copy")
         result = kvcache_ops.kvcache_scatter_copy(*self.inputs)
+        self.trace("synchronize scatter")
         torch.npu.synchronize()
         if result is not None:
             raise AssertionError("Scatter must return None.")
+        self.trace("verify bytes and read-only inputs")
         self.verify()
+        self.trace("check OK")
 
     def measure(self, barrier=None):
         if barrier is not None:

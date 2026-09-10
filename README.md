@@ -63,6 +63,8 @@ export PYTHONPATH="$PWD/torch_extension${PYTHONPATH:+:$PYTHONPATH}"
 python3 tests/test_scatter_copy.py --device npu:0 --dtype bf16 c8 --batch-size 2 --copy-count 100
 # 增加图捕获及修改 metadata 后的重放验证
 python3 tests/test_scatter_copy.py --device npu:0 --dtype bf16 c8 --batch-size 2 --copy-count 100 --graph
+# 定位原生崩溃：打印阶段标记，崩溃栈直接输出到终端
+python3 -X faulthandler -u tests/test_scatter_copy.py --device npu:0 --dtype bf16 c8 --batch-size 2 --copy-count 100 --debug
 ```
 
 逐字节检查复制内容、源/metadata 只读、caller-owned 地址、零 count、不同请求不同 count、跨 block、重复源、未使用后缀、guard block、完整容量及非默认 stream；C8 包含相邻行的非对齐搬运。失败非零退出。

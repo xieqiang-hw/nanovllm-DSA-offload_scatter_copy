@@ -1,15 +1,17 @@
 """Single-die byte-exact checks and timing for BF16 and packed-C8."""
 from dataclasses import replace
+import faulthandler
 import sys
 from _common import parse_args, print_table, summarize, workload
 
 
-def correctness_suite(config, device, graph=False):
+def correctness_suite(config, device, graph=False, debug=False):
     from _case import Case, kvcache_ops, torch
     edge_config = replace(config, batch_size=3, copy_cap=129, copy_count=129, source_len=259, hbm_slots=259)
-    case = Case(edge_config, device, counts=[0, 1, 129], edges=True)
+    case = Case(edge_config, device, counts=[0, 1, 129], edges=True, debug=debug)
     case.check()
     # Non-default stream, with caller-owned allocations created on the original stream.
+    case.trace("check non-default stream")
     stream = torch.npu.Stream()
     stream.wait_stream(torch.npu.current_stream())
     with torch.npu.stream(stream):
@@ -18,6 +20,7 @@ def correctness_suite(config, device, graph=False):
     torch.npu.synchronize()
     case.verify()
     if graph:
+        case.trace("check graph replay")
         original = case.counts_cpu.tolist()
         case.set_counts([0, 0, 0])
         case.check()
@@ -51,12 +54,12 @@ def correctness_suite(config, device, graph=False):
     del case
     # Exercise full caller-provided capacity, including an exact-full destination.
     cap = config.copy_cap
-    full = Case(replace(config, batch_size=1, copy_count=cap, source_len=cap, hbm_slots=cap), device)
+    full = Case(replace(config, batch_size=1, copy_count=cap, source_len=cap, hbm_slots=cap), device, debug=debug)
     full.check()
     full.set_counts([0])
     full.check()
     del full
-    sparse = Case(replace(config, batch_size=1, copy_cap=65536, copy_count=1, source_len=128, hbm_slots=128), device)
+    sparse = Case(replace(config, batch_size=1, copy_cap=65536, copy_count=1, source_len=128, hbm_slots=128), device, debug=debug)
     sparse.check()
     print(f"CHECK dtype={config.dtype}: byte-exact, caller-owned, guards, counts, stream, capacity"
           + (", graph" if graph else "") + " OK", flush=True)
@@ -64,13 +67,18 @@ def correctness_suite(config, device, graph=False):
 
 def main(argv=None):
     args = parse_args(argv)
-    from _case import Case, torch
+    if args.debug:
+        print("DEBUG importing kvcache_ops / torch / torch_npu", flush=True)
+    from _case import Case, kvcache_ops, torch, torch_npu
+    if args.debug:
+        print(f"DEBUG imports OK: torch={torch.__version__}, torch_npu={torch_npu.__version__}, package={kvcache_ops.__file__}", flush=True)
     rows = []
     for dtype in args.dtype:
         config = workload(args, dtype, args.batch_size, args.copy_count)
-        correctness_suite(config, args.device, args.graph)
-        case = Case(config, args.device)
+        correctness_suite(config, args.device, args.graph, args.debug)
+        case = Case(config, args.device, debug=args.debug)
         case.check()
+        case.trace("benchmark warmup / event timing / verification")
         rows.append(summarize(config, [case.measure()]))
         del case
         torch.npu.empty_cache()
@@ -78,6 +86,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    faulthandler.enable(all_threads=True)
     try:
         main()
     except (Exception, KeyboardInterrupt) as error:

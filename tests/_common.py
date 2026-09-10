@@ -48,6 +48,7 @@ def parse_args(argv=None, *, multi=False):
         parser.add_argument("--device", default="npu:0")
         parser.add_argument("--dtype", choices=tuple(ROW_BYTES), nargs="+", default=list(ROW_BYTES))
         parser.add_argument("--graph", action="store_true", help="Also verify NPU graph replay with updated metadata.")
+        parser.add_argument("--debug", action="store_true", help="Print initialization/call stages to locate native crashes.")
     parser.add_argument("--batch-size", type=int, nargs="+" if multi else None, default=[8] if multi else 8)
     parser.add_argument("--copy-count", type=int, nargs="+" if multi else None, default=[300] if multi else 300)
     for name, default in (("source-len", 65536), ("hbm-slots", 8192), ("copy-cap", 16384),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import faulthandler
 import os
 import sys
 import time
@@ -12,6 +13,7 @@ from _common import cases, parse_args, print_table, summarize
 
 
 def worker(config, device, barrier, connection):
+    faulthandler.enable(all_threads=True)
     try:
         from _case import Case
         case = Case(config, f"npu:{device}")
@@ -96,6 +98,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    faulthandler.enable(all_threads=True)
     try:
         main()
     except (Exception, KeyboardInterrupt) as error:
